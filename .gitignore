@@ -1,0 +1,8 @@
+.env
+options_flow.db
+options_flow.log
+logs/
+__pycache__/
+*.pyc
+*.pyo
+nifty_instruments.json
