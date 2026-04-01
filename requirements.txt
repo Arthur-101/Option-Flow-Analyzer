@@ -5,3 +5,4 @@ requests
 websocket-client
 apscheduler==3.10.4
 pytz
+numpy

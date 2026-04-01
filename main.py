@@ -5,7 +5,7 @@ import sys
 
 from db import init_db
 from ws_feed import start_feed
-from scheduler import build_scheduler
+from scheduler import start_scheduler
 from config import SYMBOLS
 
 
@@ -44,7 +44,7 @@ def main() -> None:
     time.sleep(15)
 
     # 4. Hand off to scheduler (blocking)
-    scheduler = build_scheduler()
+    scheduler = start_scheduler()
     logger.info(
         "Scheduler started — flushing to DB every 5 min during market hours. "
         "Press Ctrl+C to stop."

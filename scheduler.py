@@ -1,102 +1,86 @@
-# scheduler.py — APScheduler job definitions
+# scheduler.py — APScheduler setup for main OFA project
+#
+# Jobs:
+#   poll_job      — every 5 min 9:15–15:30 IST (Mon-Fri)
+#                   flush WS ticks → DB, then run anomaly detector
+#   purge_job     — daily 00:05 IST: delete rows older than retention window
 
-import time
 import logging
-from datetime import datetime
-
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
-
-from config import POLL_INTERVAL_MINUTES, MARKET_OPEN_TIME, MARKET_CLOSE_TIME, SYMBOLS
-from ws_feed import flush_to_db, is_connected, tick_count
-from db import purge_old_data
+from apscheduler.schedulers.background import BackgroundScheduler
+from config import SYMBOLS, POLL_INTERVAL_MINUTES
 
 logger = logging.getLogger(__name__)
-
 IST = pytz.timezone("Asia/Kolkata")
 
-
-# ── Market hours guard ────────────────────────────────────────────────────────
-
-def _is_market_open() -> bool:
-    """
-    Returns True only during NSE trading hours on weekdays (IST).
-    Skips weekends automatically.
-    """
-    now = datetime.now(IST)
-
-    # Skip Saturday (5) and Sunday (6)
-    if now.weekday() >= 5:
-        return False
-
-    open_h,  open_m  = map(int, MARKET_OPEN_TIME.split(":"))
-    close_h, close_m = map(int, MARKET_CLOSE_TIME.split(":"))
-
-    market_open  = now.replace(hour=open_h,  minute=open_m,  second=0, microsecond=0)
-    market_close = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
-
-    return market_open <= now <= market_close
+_scheduler: BackgroundScheduler | None = None
 
 
-# ── Poll job (runs every 5 min, guarded by market hours) ─────────────────────
+def _poll_job():
+    from ws_feed import flush_to_db
+    from detector import run_detection
 
-def poll_job() -> None:
-    """Called by APScheduler every POLL_INTERVAL_MINUTES minutes."""
-    if not _is_market_open():
-        logger.debug("Market closed — skipping poll")
-        return
-
-    if not is_connected():
-        logger.warning("WebSocket not connected — skipping flush (ticks=%d)", tick_count())
-        return
-
-    logger.info("── Flush cycle  (ticks in store: %d) ──────────────────", tick_count())
-    for symbol in SYMBOLS:
+    for sym in SYMBOLS:
         try:
-            rows = flush_to_db(symbol)
-            logger.info("%s: %d rows written to DB", symbol, len(rows))
-        except Exception as exc:
-            logger.error("Unhandled error for %s: %s", symbol, exc, exc_info=True)
+            # Step 1: flush WebSocket ticks to DB
+            rows = flush_to_db(sym)
+            if rows:
+                logger.info("poll_job: %d rows flushed for %s", len(rows), sym)
+
+                # Step 2: run anomaly detector on fresh data
+                signals = run_detection(sym)
+                if signals:
+                    logger.info("poll_job: %d signals fired for %s", len(signals), sym)
+                    for s in signals:
+                        logger.info(
+                            "  → %s | %s %.0f %s | strength=%.2f | bias=%s | mode=%s",
+                            s["signal_type"], sym, s["strike"], s["option_type"],
+                            s["signal_strength"], s["bias"], s["mode"]
+                        )
+        except Exception as e:
+            logger.error("poll_job error for %s: %s", sym, e, exc_info=True)
 
 
-# ── Daily purge job (runs once at midnight) ───────────────────────────────────
-
-def purge_job() -> None:
-    """Delete rows older than retention window. Runs daily at 00:05 IST."""
-    logger.info("Running daily retention purge …")
+def _purge_job():
+    from db import purge_old_data
+    logger.info("purge_job fired")
     try:
         purge_old_data()
-    except Exception as exc:
-        logger.error("Purge failed: %s", exc, exc_info=True)
+    except Exception as e:
+        logger.error("purge_job error: %s", e)
 
 
-# ── Scheduler factory ─────────────────────────────────────────────────────────
+def start_scheduler() -> BackgroundScheduler:
+    global _scheduler
 
-def build_scheduler() -> BlockingScheduler:
-    """
-    Create and configure the APScheduler instance.
-    Returns a BlockingScheduler — call .start() on it from main.py.
-    """
-    scheduler = BlockingScheduler(timezone=IST)
+    _scheduler = BackgroundScheduler(timezone=IST)
 
-    # Poll every N minutes
-    scheduler.add_job(
-        poll_job,
-        trigger="interval",
-        minutes=POLL_INTERVAL_MINUTES,
-        id="poll_options_chain",
-        name=f"Poll options chain every {POLL_INTERVAL_MINUTES} min",
-        misfire_grace_time=60,   # tolerate up to 60s delay before skipping
+    # Every 5 min, 9:15–15:30 IST — flush + detect
+    _scheduler.add_job(
+        _poll_job,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour="9-15",
+        minute=f"*/{POLL_INTERVAL_MINUTES}",
+        id="poll_job",
+        name="5-min flush + detection",
+        misfire_grace_time=60,
     )
 
     # Daily purge at 00:05 IST
-    scheduler.add_job(
-        purge_job,
+    _scheduler.add_job(
+        _purge_job,
         trigger="cron",
         hour=0,
         minute=5,
-        id="daily_purge",
-        name="Daily data retention purge",
+        id="purge_job",
+        name="Daily retention purge",
+        misfire_grace_time=300,
     )
 
-    return scheduler
+    _scheduler.start()
+    logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
+    for job in _scheduler.get_jobs():
+        logger.info("  → %s | next run: %s", job.name, job.next_run_time)
+
+    return _scheduler
