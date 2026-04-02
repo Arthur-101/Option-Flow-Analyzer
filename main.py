@@ -2,6 +2,8 @@
 
 import logging
 import sys
+import time
+import threading
 
 from db import init_db
 from ws_feed import start_feed
@@ -24,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Bootstrap ─────────────────────────────────────────────────────────────────
+# ── Bootstrap ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
     logger.info("═" * 60)
@@ -34,27 +36,27 @@ def main() -> None:
     # 1. Initialise database
     init_db()
 
-    # 2. Start WebSocket feed in background (streams OI + volume + LTP live)
+    # 2. Start WebSocket feed in background thread
     logger.info("Starting Angel One WebSocket feed …")
     start_feed(SYMBOLS)
 
-    # 3. Wait briefly for WebSocket to connect and receive first ticks
-    import time
+    # 3. Wait for WebSocket to connect and receive first ticks
     logger.info("Waiting 15s for WebSocket to warm up …")
     time.sleep(15)
 
-    # 4. Hand off to scheduler (blocking)
-    scheduler = start_scheduler()
+    # 4. Start scheduler in background (already calls scheduler.start() internally)
+    start_scheduler()
     logger.info(
-        "Scheduler started — flushing to DB every 5 min during market hours. "
+        "Scheduler started — flushing + detecting every 5 min during market hours. "
         "Press Ctrl+C to stop."
     )
 
+    # 5. Keep main thread alive — scheduler + WebSocket run in background threads
+    stop_event = threading.Event()
     try:
-        scheduler.start()
+        stop_event.wait()   # blocks until KeyboardInterrupt
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown requested — stopping scheduler")
-        scheduler.shutdown(wait=False)
+        logger.info("Shutdown requested — stopping.")
         logger.info("Options Flow Analyzer stopped cleanly.")
 
 
