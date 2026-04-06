@@ -21,7 +21,7 @@ from config import DB_PATH
 logger = logging.getLogger(__name__)
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL    = "gemini-2.5-flash-preview-04-17"
+GEMINI_MODEL    = "gemini-2.5-flash"
 GEMINI_API_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 MAX_CALLS_PER_CYCLE = 5   # rate limit per 5-min poll
