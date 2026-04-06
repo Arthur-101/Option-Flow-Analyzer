@@ -144,10 +144,13 @@ def _call_gemini(prompt: str) -> dict | None:
             {"role": "user", "parts": [{"text": prompt}]}
         ],
         "generationConfig": {
-            "temperature": 0.3,       # low temp for consistent structured output
-            "maxOutputTokens": 512,
+            "temperature": 0.3,
+            "maxOutputTokens": 1024,
             "responseMimeType": "application/json",
-        }
+            "thinkingConfig": {
+                "thinkingBudget": 0
+            }
+        },
     }
 
     try:
@@ -160,15 +163,27 @@ def _call_gemini(prompt: str) -> dict | None:
         data = resp.json()
 
         # Extract text content
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        # Extract text from all parts (thinking mode may add extra parts)
+        parts = data["candidates"][0]["content"]["parts"]
+        text = ""
+        for part in parts:
+            if "text" in part:
+                text += part["text"]
+
+        text = text.strip()
 
         # Strip markdown fences if present
-        text = text.strip()
-        if text.startswith("```"):
+        if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
-        text = text.strip()
+            text = text.strip()
+
+        # Find JSON object if wrapped in other text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            text = text[start:end]
 
         return json.loads(text)
 
