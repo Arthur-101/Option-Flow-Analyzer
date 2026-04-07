@@ -106,24 +106,25 @@ else:
         llm_conf = sig.get("llm_confidence")
 
         if thesis:
-            thesis_html = f"""
-            <div style="margin-top:12px;">
-                <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
-                    <span style="font-family:'IBM Plex Mono',monospace; font-size:9px;
-                                 letter-spacing:0.12em; text-transform:uppercase; color:#4B5268;">
-                        AI Thesis
-                    </span>
-                    {bias_badge(llm_bias) if llm_bias else ''}
-                    <span style="font-size:13px;">{confidence_stars(llm_conf)}</span>
-                </div>
-                <div class="thesis-text">{thesis}</div>
-            </div>"""
+            thesis_html = (
+                '<div style="margin-top:12px;">'
+                '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">'
+                '<span style="font-family:IBM Plex Mono,monospace;font-size:9px;'
+                'letter-spacing:0.12em;text-transform:uppercase;color:#4B5268;">AI Thesis</span>'
+                + (bias_badge(llm_bias) if llm_bias else '')
+                + '<span style="font-size:13px;">' + confidence_stars(llm_conf) + '</span>'
+                '</div>'
+                '<div style="font-family:IBM Plex Sans,sans-serif;font-size:13px;line-height:1.6;'
+                'color:#8B92A8;margin-top:4px;padding:12px 14px;background:#13161E;'
+                'border-radius:6px;border-left:2px solid #2E3547;">'
+                + str(thesis)
+                + '</div></div>'
+            )
         else:
-            thesis_html = """
-            <div style="margin-top:8px; font-family:'IBM Plex Mono',monospace;
-                        font-size:10px; color:#4B5268; font-style:italic;">
-                thesis pending...
-            </div>"""
+            thesis_html = (
+                '<div style="margin-top:8px;font-family:IBM Plex Mono,monospace;'
+                'font-size:10px;color:#4B5268;font-style:italic;">thesis pending...</div>'
+            )
 
         # Render entire card in ONE st.markdown call — Streamlit strips unclosed divs between calls
         st.markdown(f"""
