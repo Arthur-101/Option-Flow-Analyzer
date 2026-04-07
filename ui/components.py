@@ -362,25 +362,42 @@ def empty_state(message: str):
 # ── Format helpers ─────────────────────────────────────────────────────────────
 
 def fmt_oi(val) -> str:
-    if val is None or val == 0:
+    try:
+        if val is None:
+            return "—"
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return "—"
+        val = int(val)
+        if val == 0:
+            return "—"
+        if abs(val) >= 1_000_000:
+            return f"{val/1_000_000:.2f}M"
+        elif abs(val) >= 1_000:
+            return f"{val/1_000:.1f}K"
+        return str(val)
+    except (TypeError, ValueError):
         return "—"
-    if abs(val) >= 1_000_000:
-        return f"{val/1_000_000:.2f}M"
-    elif abs(val) >= 1_000:
-        return f"{val/1_000:.1f}K"
-    return str(int(val))
 
 
 def fmt_price(val) -> str:
-    if val is None:
+    try:
+        import math
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return "—"
+        return f"₹{float(val):,.2f}"
+    except (TypeError, ValueError):
         return "—"
-    return f"₹{val:,.2f}"
 
 
 def fmt_pct(val) -> str:
-    if val is None:
+    try:
+        import math
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return "—"
+        return f"{float(val):.2f}%"
+    except (TypeError, ValueError):
         return "—"
-    return f"{val:.2f}%"
 
 
 def oi_change_color(val) -> str:
