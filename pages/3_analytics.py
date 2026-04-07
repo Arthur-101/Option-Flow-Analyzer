@@ -287,9 +287,9 @@ else:
         ))
 
         fig.update_layout(
-            **PLOTLY_LAYOUT,
+            **{k: v for k, v in PLOTLY_LAYOUT.items() if k != "yaxis"},
             title=dict(text="RSI (14) — NIFTY Spot", font=dict(size=12, color="#8B92A8")),
             height=260,
-            yaxis=dict(range=[0, 100], gridcolor="#1E2330"),
+            yaxis=dict(range=[0, 100], gridcolor="#1E2330", tickfont=dict(size=10)),
         )
         st.plotly_chart(fig, use_container_width=True)
