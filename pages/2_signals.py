@@ -1,197 +1,127 @@
-# pages/2_signals.py — Detected Signals + LLM Thesis
-
-import sys
-import os
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime, timezone, timedelta
 
 import streamlit as st
-import pandas as pd
-from datetime import date
+from ui.components import inject_global_css, metric_card_c, section_header, empty_state, sig_type_badge, bias_bdg, conf_pips, fmt_oi, fmt_oi_change, fmt_price, fmt_pct
+from ui.queries import get_all_signals, get_signal_stats, get_news_for_signal
 
-from ui.components import (
-    inject_global_css, section_header, empty_state,
-    signal_badge, bias_badge, confidence_stars,
-    fmt_oi, fmt_price, fmt_pct, metric_card,
-)
-from ui.queries import (
-    get_today_signals, get_all_signals,
-    get_signal_stats, get_news_for_signal,
-)
-
-st.set_page_config(page_title="Signals · OFA", layout="wide")
+st.set_page_config(page_title="Signals · OFA", layout="wide", initial_sidebar_state="expanded")
 inject_global_css()
 
-# ── Header ─────────────────────────────────────────────────────────────────────
-col_h1, col_h2 = st.columns([3, 1])
-with col_h1:
-    st.markdown("""
-    <div style="padding-bottom:8px;">
-        <span style="font-family:'IBM Plex Mono',monospace; font-size:22px;
-                     font-weight:600; color:#E8EAF0;">
-            🎯 Signals
-        </span>
-        <span style="font-family:'IBM Plex Mono',monospace; font-size:11px;
-                     color:#4B5268; margin-left:12px; letter-spacing:0.08em;">
-            ANOMALY DETECTION · AI THESIS
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
-with col_h2:
-    if st.button("↻ Refresh", use_container_width=True):
-        st.rerun()
+st.markdown("""
+<div style="padding:24px 24px 0">
+    <div style="font-size:20px;font-weight:700;color:#F0F4FF;letter-spacing:-0.02em">Signals</div>
+    <div style="font-size:12px;color:#505A75;margin-top:2px">Anomaly detection · AI-powered thesis generation</div>
+</div>""", unsafe_allow_html=True)
 
-# ── Stats row ──────────────────────────────────────────────────────────────────
+# ── Stats ──────────────────────────────────────────────────────────────────────
 stats = get_signal_stats()
-
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    metric_card("Today's Signals", str(stats.get("today", 0)))
-with m2:
-    metric_card("Bullish Today", str(stats.get("bullish_today", 0)), style="bullish")
-with m3:
-    metric_card("Bearish Today", str(stats.get("bearish_today", 0)), style="bearish")
-with m4:
-    metric_card("With AI Thesis", str(stats.get("with_thesis", 0)), style="green")
-
-st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
+st.markdown("<div style='padding:16px 24px 0'>", unsafe_allow_html=True)
+cols = st.columns(4, gap="small")
+with cols[0]: metric_card_c("Today's Signals", str(stats.get("today", 0)))
+with cols[1]: metric_card_c("Bullish", str(stats.get("bullish", 0)), color="amber")
+with cols[2]: metric_card_c("Bearish", str(stats.get("bearish", 0)), color="red")
+with cols[3]: metric_card_c("With AI Thesis", str(stats.get("with_thesis", 0)), color="green")
+st.markdown("</div>", unsafe_allow_html=True)
+st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
 # ── Filters ────────────────────────────────────────────────────────────────────
 section_header("Signal Feed")
 
+st.markdown("<div style='padding:0 24px 12px'>", unsafe_allow_html=True)
 f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
-with f1:
-    time_range = st.selectbox("Period", ["Today", "Last 3 days", "Last 7 days"], label_visibility="collapsed")
-with f2:
-    bias_filter = st.selectbox("Bias", ["All", "BULLISH", "BEARISH", "NEUTRAL"], label_visibility="collapsed")
-with f3:
-    type_filter = st.selectbox("Type", ["All", "OI_BUILDUP", "OI_UNWIND", "VOLUME_SPIKE", "IV_SPIKE"], label_visibility="collapsed")
-with f4:
-    thesis_only = st.checkbox("With thesis only", value=False)
+with f1: period = st.selectbox("Period", ["Today", "Last 3 days", "Last 7 days"], label_visibility="collapsed")
+with f2: bias_f = st.selectbox("Bias", ["All biases", "BULLISH", "BEARISH", "NEUTRAL"], label_visibility="collapsed")
+with f3: type_f = st.selectbox("Type", ["All types", "OI_BUILDUP", "OI_UNWIND", "VOLUME_SPIKE", "IV_SPIKE"], label_visibility="collapsed")
+with f4: thesis_only = st.checkbox("With thesis only", value=False)
+st.markdown("</div>", unsafe_allow_html=True)
 
-# Load data
+# ── Load + filter ──────────────────────────────────────────────────────────────
 days_map = {"Today": 1, "Last 3 days": 3, "Last 7 days": 7}
-days = days_map[time_range]
-signals = get_all_signals(days=days)
+signals = get_all_signals(days=days_map[period])
 
-# Apply filters
 if not signals.empty:
-    if bias_filter != "All":
-        signals = signals[signals["bias"] == bias_filter]
-    if type_filter != "All":
-        signals = signals[signals["signal_type"] == type_filter]
-    if thesis_only:
-        signals = signals[signals["llm_thesis"].notna()]
+    if bias_f != "All biases": signals = signals[signals["bias"] == bias_f]
+    if type_f != "All types": signals = signals[signals["signal_type"] == type_f]
+    if thesis_only: signals = signals[signals["llm_thesis"].notna()]
 
 # ── Signal cards ───────────────────────────────────────────────────────────────
+st.markdown("<div style='padding:0 24px 24px'>", unsafe_allow_html=True)
+
 if signals.empty:
-    empty_state("NO SIGNALS · Detection runs every 5 minutes during market hours")
+    empty_state("No signals found", "Detection runs every 5 minutes during market hours (9:15–15:30 IST)")
 else:
     for _, sig in signals.iterrows():
-        bias = sig.get("bias", "NEUTRAL") or "NEUTRAL"
-        bias_cls = bias.lower()
+        bias = (sig.get("bias") or "NEUTRAL").upper()
+        bias_cls = {"BULLISH": "bull", "BEARISH": "bear"}.get(bias, "neutral")
 
-        # Convert UTC timestamp to IST for display
+        # Timestamp → IST
         ts_raw = sig.get("fired_at", "")
         try:
-            from datetime import datetime, timezone, timedelta
-            ts_dt = datetime.strptime(ts_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            ts_ist = ts_dt + timedelta(hours=5, minutes=30)
-            ts_display = ts_ist.strftime("%d %b %Y · %H:%M IST")
-        except:
-            ts_display = ts_raw[:16]
+            dt = datetime.strptime(ts_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            ts_ist = (dt + timedelta(hours=5, minutes=30)).strftime("%d %b · %H:%M IST")
+        except: ts_ist = ts_raw[:16]
 
-        # Build thesis HTML
+        # OI change color
+        oi_ch = sig.get("oi_change")
+        import math
+        oi_cls = ""
+        try:
+            if oi_ch and not math.isnan(float(oi_ch)):
+                oi_cls = "g" if float(oi_ch) > 0 else "r"
+        except: pass
+
+        # Thesis block
         thesis = sig.get("llm_thesis")
         llm_bias = sig.get("llm_bias")
         llm_conf = sig.get("llm_confidence")
 
         if thesis:
             thesis_html = (
-                '<div style="margin-top:12px;">'
-                '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">'
-                '<span style="font-family:IBM Plex Mono,monospace;font-size:9px;'
-                'letter-spacing:0.12em;text-transform:uppercase;color:#4B5268;">AI Thesis</span>'
-                + (bias_badge(llm_bias) if llm_bias else '')
-                + '<span style="font-size:13px;">' + confidence_stars(llm_conf) + '</span>'
-                '</div>'
-                '<div style="font-family:IBM Plex Sans,sans-serif;font-size:13px;line-height:1.6;'
-                'color:#8B92A8;margin-top:4px;padding:12px 14px;background:#13161E;'
-                'border-radius:6px;border-left:2px solid #2E3547;">'
+                '<div class="sig-thesis">'
+                '<div class="thesis-hd">'
+                '<span class="thesis-lbl">AI Thesis</span>'
+                + (bias_bdg(llm_bias) if llm_bias else "")
+                + '<span style="margin-left:4px">' + conf_pips(llm_conf) + '</span>'
+                + '</div>'
                 + str(thesis)
-                + '</div></div>'
+                + '</div>'
             )
         else:
-            thesis_html = (
-                '<div style="margin-top:8px;font-family:IBM Plex Mono,monospace;'
-                'font-size:10px;color:#4B5268;font-style:italic;">thesis pending...</div>'
-            )
+            thesis_html = '<div class="thesis-pending">Thesis generation pending...</div>'
 
-        # Render entire card in ONE st.markdown call — Streamlit strips unclosed divs between calls
         st.markdown(f"""
-        <div class="signal-card {bias_cls}">
-            <div style="display:flex; justify-content:space-between; align-items:flex-start; flex-wrap:wrap; gap:8px;">
-                <div>
-                    {signal_badge(sig.get('signal_type', ''))}
-                    &nbsp;
-                    {bias_badge(bias)}
-                    &nbsp;&nbsp;
-                    <span style="font-family:'IBM Plex Mono',monospace; font-size:13px;
-                                 font-weight:600; color:#E8EAF0;">
-                        {int(sig.get('strike', 0))} {sig.get('option_type', '')}
-                    </span>
-                    <span style="font-family:'IBM Plex Mono',monospace; font-size:11px;
-                                 color:#6B7280; margin-left:8px;">
-                        {sig.get('expiry', '')}
-                    </span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:10px; color:#4B5268;">
-                    {ts_display}
-                </div>
+        <div class="sig {bias_cls}">
+            <div class="sig-hd">
+                {sig_type_badge(sig.get('signal_type',''))}
+                {bias_bdg(bias)}
+                <span class="sig-strike">{int(sig.get('strike',0))} {sig.get('option_type','')}</span>
+                <span class="sig-exp">{sig.get('expiry','')}</span>
+                <span class="sig-ts">{ts_ist}</span>
             </div>
-            <div style="display:flex; gap:24px; margin-top:12px; flex-wrap:wrap;">
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    Strength &nbsp;<span style="color:#E8EAF0">{sig.get('signal_strength', 0):.2f}/5</span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    OI Δ &nbsp;<span style="color:#E8EAF0">{fmt_oi(sig.get('oi_change'))}</span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    Volume &nbsp;<span style="color:#E8EAF0">{fmt_oi(sig.get('volume'))}</span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    IV &nbsp;<span style="color:#E8EAF0">{fmt_pct(sig.get('iv'))}</span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    Spot &nbsp;<span style="color:#E8EAF0">{fmt_price(sig.get('spot_price'))}</span>
-                </div>
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8B92A8;">
-                    Mode &nbsp;<span style="color:#6B7280">{sig.get('mode', '—')}</span>
-                </div>
+            <div class="sig-stats">
+                <div class="sig-stat"><div class="ss-label">Strength</div><div class="ss-val a">{sig.get('signal_strength',0):.2f}/5</div></div>
+                <div class="sig-stat"><div class="ss-label">OI Δ</div><div class="ss-val {oi_cls}">{fmt_oi_change(oi_ch)}</div></div>
+                <div class="sig-stat"><div class="ss-label">Volume</div><div class="ss-val">{fmt_oi(sig.get('volume'))}</div></div>
+                <div class="sig-stat"><div class="ss-label">IV</div><div class="ss-val">{fmt_pct(sig.get('iv'))}</div></div>
+                <div class="sig-stat"><div class="ss-label">Spot</div><div class="ss-val">{fmt_price(sig.get('spot_price'))}</div></div>
+                <div class="sig-stat"><div class="ss-label">Mode</div><div class="ss-val" style="color:var(--text-tertiary);font-size:10px">{sig.get('mode','—')}</div></div>
             </div>
             {thesis_html}
-        </div>
-        """, unsafe_allow_html=True)
+        </div>""", unsafe_allow_html=True)
 
-        # Expandable news section
-        sig_id = int(sig.get("id", 0))
-        with st.expander("📰 Related News", expanded=False):
-            news = get_news_for_signal(sig_id)
+        # News expander
+        with st.expander("Related news", expanded=False):
+            news = get_news_for_signal(int(sig.get("id", 0)))
             if news:
                 for item in news:
                     st.markdown(f"""
-                    <div style="font-family:'IBM Plex Sans',sans-serif; font-size:12px;
-                                color:#8B92A8; padding:6px 0; border-bottom:1px solid #1E2330;">
-                        <span style="color:#E8EAF0">{item['headline']}</span>
-                        <span style="font-family:'IBM Plex Mono',monospace; font-size:10px;
-                                     color:#4B5268; margin-left:8px;">{item['source']}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    <div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+                        <div style="font-size:12px;color:#F0F4FF;line-height:1.5">{item['headline']}</div>
+                        <div style="font-size:10px;color:#505A75;margin-top:3px;font-family:'JetBrains Mono',monospace">{item['source']} · {item.get('published_at','')[:16]}</div>
+                    </div>""", unsafe_allow_html=True)
             else:
-                st.markdown("""
-                <div style="font-family:'IBM Plex Mono',monospace; font-size:11px;
-                            color:#4B5268; padding:8px 0;">
-                    No news stored for this signal window
-                </div>
-                """, unsafe_allow_html=True)
+                st.markdown("<div style='font-size:11px;color:#353D55;padding:8px 0'>No news stored for this signal window.</div>", unsafe_allow_html=True)
 
-        st.markdown("<div style='margin-bottom:4px;'></div>", unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
