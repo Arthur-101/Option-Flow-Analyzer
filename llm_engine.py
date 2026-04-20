@@ -1,32 +1,34 @@
-# llm_engine.py — LLM thesis generation using Gemini 2.5 Flash
+# llm_engine.py — LLM thesis generation using DeepSeek V3 via OpenRouter
 #
 # Takes a signal + market context + news headlines.
 # Returns structured thesis: text, bias, confidence.
 # Writes results back to signals table.
 #
 # Design principles:
-# - System prompt is CONSTANT → enables Gemini prompt caching (saves tokens)
+# - System prompt is CONSTANT → enables better reasoning consistency
 # - Context is variable → injected per call
 # - LLM interprets contradictions, never hardcoded rules
-# - Max 5 calls per poll cycle to stay within free tier
+# - Max 20 calls per poll cycle (DeepSeek has higher limits than Gemini)
 
 import os
 import json
 import logging
 import sqlite3
 import requests
+import time
 from datetime import datetime, timezone
 from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL    = "gemini-2.5-flash"
-GEMINI_API_URL  = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")  # DeepSeek V3
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-MAX_CALLS_PER_CYCLE = 5   # rate limit per 5-min poll
+MAX_CALLS_PER_CYCLE = 20   # DeepSeek handles higher throughput than Gemini
+DELAY_BETWEEN_CALLS = 1.0  # 1 second delay between calls for safety
 
-# ── System prompt (CONSTANT — enables caching) ─────────────────────────────────
+# ── System prompt (CONSTANT — enables reasoning consistency) ───────────────────
 
 SYSTEM_PROMPT = """You are an institutional options flow analyst specializing in NSE NIFTY index options.
 
@@ -125,54 +127,55 @@ Generate your thesis JSON now:"""
     return prompt
 
 
-# ── Gemini API call ────────────────────────────────────────────────────────────
+# ── OpenRouter API call ────────────────────────────────────────────────────────
 
-def _call_gemini(prompt: str) -> dict | None:
+def _call_openrouter(prompt: str) -> dict | None:
     """
-    Call Gemini 2.5 Flash API and parse JSON response.
+    Call OpenRouter API (DeepSeek V3) and parse JSON response.
     Returns parsed dict or None on failure.
     """
-    if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY not set")
+    if not OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY not set")
         return None
 
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://github.com/Arthur-101/Option-Flow-Analyzer",  # Optional - for rankings
+        "X-Title": "Options Flow Analyzer",  # Optional - shows in OpenRouter dashboard
+        "Content-Type": "application/json"
+    }
+
     payload = {
-        "system_instruction": {
-            "parts": [{"text": SYSTEM_PROMPT}]
-        },
-        "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1024,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {
-                "thinkingBudget": 0
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
             }
-        },
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1024,
+        "response_format": {"type": "json_object"}  # Force JSON output
     }
 
     try:
         resp = requests.post(
-            f"{GEMINI_API_URL}?key={GEMINI_API_KEY}",
+            OPENROUTER_API_URL,
+            headers=headers,
             json=payload,
-            timeout=30,
+            timeout=60,  # DeepSeek V3 can take longer than Gemini
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # Extract text content
-        # Extract text from all parts (thinking mode may add extra parts)
-        parts = data["candidates"][0]["content"]["parts"]
-        text = ""
-        for part in parts:
-            if "text" in part:
-                text += part["text"]
+        # Extract response content
+        text = data["choices"][0]["message"]["content"].strip()
 
-        text = text.strip()
-
-        # Strip markdown fences if present
+        # Strip markdown fences if present (some models still add them)
         if "```" in text:
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -188,11 +191,17 @@ def _call_gemini(prompt: str) -> dict | None:
         return json.loads(text)
 
     except requests.RequestException as e:
-        logger.error("Gemini API request failed: %s", e)
+        logger.error("OpenRouter API request failed: %s", e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                logger.error("Error details: %s", error_detail)
+            except:
+                logger.error("Response text: %s", e.response.text[:500])
     except (KeyError, IndexError) as e:
-        logger.error("Gemini response parse error: %s", e)
+        logger.error("OpenRouter response parse error: %s", e)
     except json.JSONDecodeError as e:
-        logger.error("Gemini returned invalid JSON: %s", e)
+        logger.error("OpenRouter returned invalid JSON: %s | Raw text: %s", e, text[:200])
 
     return None
 
@@ -240,8 +249,8 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
     if not signals:
         return 0
 
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY not set — skipping LLM thesis generation")
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY not set — skipping LLM thesis generation")
         return 0
 
     # Rate limit: only process top N signals per cycle
@@ -253,7 +262,7 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
     )[:MAX_CALLS_PER_CYCLE]
 
     generated = 0
-    for signal in sorted_signals:
+    for i, signal in enumerate(sorted_signals):
         signal_id = signal.get("id")
         if not signal_id:
             logger.warning("Signal missing id field — skipping")
@@ -261,7 +270,7 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
 
         try:
             prompt = _build_prompt(signal, context, headlines)
-            result = _call_gemini(prompt)
+            result = _call_openrouter(prompt)
 
             if result:
                 _write_thesis_to_db(signal_id, result)
@@ -275,6 +284,10 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
                 )
             else:
                 logger.warning("No thesis generated for signal %d", signal_id)
+
+            # Rate limiting delay (except after last call)
+            if i < len(sorted_signals) - 1:
+                time.sleep(DELAY_BETWEEN_CALLS)
 
         except Exception as e:
             logger.error("Thesis generation error for signal %d: %s", signal_id, e)
