@@ -22,7 +22,7 @@ from config import DB_PATH
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v3.2")  # DeepSeek V3
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")  # DeepSeek V3
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 MAX_CALLS_PER_CYCLE = 20   # DeepSeek handles higher throughput
