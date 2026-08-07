@@ -1,5 +1,5 @@
-# Option Flow Analyzer (recently started)
- *Everything written in here is how it will work in the future after it is finished*
+# Option Flow Analyzer
+<!-- *Everything written in here is how it will work in the future after it is finished* -->
 > An AI-powered NSE options flow monitor that detects unusual activity in NIFTY index options and generates trading theses using LLMs.
 
 **Portfolio project** demonstrating agentic AI + financial data engineering on Indian markets.
