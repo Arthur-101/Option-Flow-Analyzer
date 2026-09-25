@@ -59,6 +59,18 @@ with st.sidebar:
         </div>
     </div>""", unsafe_allow_html=True)
 
+    st.markdown("<div style='height:1px;background:rgba(255,255,255,0.06);margin:16px 16px 12px'></div>", unsafe_allow_html=True)
+
+    if st.button("🔄 Sync with Cloud", use_container_width=True, help="Pull latest data from Supabase"):
+        from sync_supabase import sync_data
+        with st.spinner("Syncing latest market data from Supabase..."):
+            try:
+                chain_count, sig_count = sync_data()
+                st.success(f"Synced! {chain_count} chain rows + {sig_count} signals")
+            except Exception as e:
+                st.error(f"Sync failed: {e}")
+        st.rerun()
+
 # ── Home ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:70vh;text-align:center;padding:40px">

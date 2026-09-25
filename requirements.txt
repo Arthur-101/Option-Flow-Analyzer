@@ -6,3 +6,5 @@ websocket-client
 apscheduler==3.10.4
 pytz
 numpy
+supabase>=2.0.0
+psycopg2-binary

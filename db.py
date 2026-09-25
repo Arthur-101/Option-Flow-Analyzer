@@ -53,6 +53,10 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_oc_date
                 ON options_chain(DATE(timestamp), symbol);
 
+            -- Deduplication constraint (Layer 3 of 3-layer zero-duplicate strategy)
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_local_chain
+                ON options_chain(timestamp, symbol, expiry, strike, option_type);
+
             -- Table 2: raw news headlines
             CREATE TABLE IF NOT EXISTS news_raw (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,7 +119,7 @@ def insert_options_rows(rows: list[dict]) -> None:
     if not rows:
         return
     sql = """
-        INSERT INTO options_chain
+        INSERT OR IGNORE INTO options_chain
             (timestamp, symbol, expiry, strike, option_type,
              oi, oi_change, volume, iv, last_price, spot_price)
         VALUES
