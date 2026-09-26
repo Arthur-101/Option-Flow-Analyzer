@@ -16,14 +16,21 @@ import logging
 import sqlite3
 import requests
 import time
-from datetime import datetime, timezone
+from dotenv import load_dotenv
 from config import DB_PATH
 
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "bytedance-seed/seed-1.6-flash")
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# ── LLM Configuration (OpenAI-compatible: OpenRouter, DeepSeek, Groq, etc.) ───
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+LLM_API_URL = os.getenv("LLM_API_URL") or os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+LLM_MODEL   = os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL", "bytedance-seed/seed-1.6-flash")
+
+# Aliases for backward compatibility
+OPENROUTER_API_KEY = LLM_API_KEY
+OPENROUTER_API_URL = LLM_API_URL
+OPENROUTER_MODEL   = LLM_MODEL
 
 MAX_CALLS_PER_CYCLE = 20
 DELAY_BETWEEN_CALLS = 1.5  # 1.5 second delay between calls for safety
@@ -127,26 +134,26 @@ Generate your thesis JSON now:"""
     return prompt
 
 
-# ── OpenRouter API call ────────────────────────────────────────────────────────
+# ── LLM API call ──────────────────────────────────────────────────────────────
 
 def _call_openrouter(prompt: str) -> dict | None:
     """
-    Call OpenRouter API (DeepSeek V3) and parse JSON response.
+    Call OpenAI-compatible LLM API (OpenRouter, DeepSeek, Groq, etc.) and parse JSON response.
     Returns parsed dict or None on failure.
     """
-    if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY not set")
+    if not LLM_API_KEY:
+        logger.error("LLM_API_KEY (or OPENROUTER_API_KEY) not set in .env")
         return None
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {LLM_API_KEY}",
         "HTTP-Referer": "https://github.com/Arthur-101/Option-Flow-Analyzer",  # Optional - for rankings
         "X-Title": "Options Flow Analyzer",  # Optional - shows in OpenRouter dashboard
         "Content-Type": "application/json"
     }
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": LLM_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -164,10 +171,10 @@ def _call_openrouter(prompt: str) -> dict | None:
 
     try:
         resp = requests.post(
-            OPENROUTER_API_URL,
+            LLM_API_URL,
             headers=headers,
             json=payload,
-            timeout=60,  # DeepSeek V3 can take longer than Gemini
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -191,7 +198,7 @@ def _call_openrouter(prompt: str) -> dict | None:
         return json.loads(text)
 
     except requests.RequestException as e:
-        logger.error("OpenRouter API request failed: %s", e)
+        logger.error("LLM API request failed (%s): %s", LLM_API_URL, e)
         if hasattr(e, 'response') and e.response is not None:
             try:
                 error_detail = e.response.json()
@@ -199,11 +206,15 @@ def _call_openrouter(prompt: str) -> dict | None:
             except:
                 logger.error("Response text: %s", e.response.text[:500])
     except (KeyError, IndexError) as e:
-        logger.error("OpenRouter response parse error: %s", e)
+        logger.error("LLM response parse error: %s", e)
     except json.JSONDecodeError as e:
-        logger.error("OpenRouter returned invalid JSON: %s | Raw text: %s", e, text[:200])
+        logger.error("LLM returned invalid JSON: %s | Raw text: %s", e, text[:200])
 
     return None
+
+
+# Function alias
+_call_llm = _call_openrouter
 
 
 # ── DB write ───────────────────────────────────────────────────────────────────
@@ -249,8 +260,8 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
     if not signals:
         return 0
 
-    if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY not set — skipping LLM thesis generation")
+    if not LLM_API_KEY:
+        logger.warning("LLM_API_KEY (or OPENROUTER_API_KEY) not set — skipping LLM thesis generation")
         return 0
 
     # Rate limit: only process top N signals per cycle
