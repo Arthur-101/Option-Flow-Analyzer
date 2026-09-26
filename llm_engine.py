@@ -245,14 +245,25 @@ def _call_llm(prompt: str) -> dict | None:
                     "[Model %d/%d] ⚠️ %s returned HTTP 400 (bad request / context length): %s",
                     idx, total, model, err_msg
                 )
-                # Continue to next model (might have larger context)
-            else:
-                # Non-retryable error (401 auth, 403 forbidden, etc.)
+                # Continue to next model
+            elif status == 403:
+                logger.warning(
+                    "[Model %d/%d] ⚠️ %s returned HTTP 403 (model restricted/gated): %s",
+                    idx, total, model, err_msg
+                )
+                # Continue to next model
+            elif status == 401:
                 logger.error(
-                    "[Model %d/%d] ❌ %s returned HTTP %d (non-retryable): %s",
+                    "[Model %d/%d] ❌ %s returned HTTP 401 (Unauthorized): Check your LLM_API_KEY in .env",
+                    idx, total, model
+                )
+                return None  # Bad API key — don't bother trying other models
+            else:
+                logger.warning(
+                    "[Model %d/%d] ⚠️ %s returned HTTP %d: %s",
                     idx, total, model, status, err_msg
                 )
-                return None  # Don't try other models — likely an API key issue
+                # Continue to next model
 
         except (requests.ConnectionError, requests.Timeout) as e:
             logger.warning(
