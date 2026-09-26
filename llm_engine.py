@@ -25,12 +25,23 @@ logger = logging.getLogger(__name__)
 # ── LLM Configuration (OpenAI-compatible: OpenRouter, DeepSeek, Groq, etc.) ───
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 LLM_API_URL = os.getenv("LLM_API_URL") or os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
-LLM_MODEL   = os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL", "bytedance-seed/seed-1.6-flash")
+
+# Model Fallback Chain — comma-separated, tried in order.
+# If LLM_MODELS is set, it takes priority. Otherwise falls back to LLM_MODEL.
+_models_raw = os.getenv("LLM_MODELS", "")
+LLM_MODELS = [m.strip() for m in _models_raw.split(",") if m.strip()]
+if not LLM_MODELS:
+    LLM_MODELS = [os.getenv("LLM_MODEL") or os.getenv("OPENROUTER_MODEL", "bytedance-seed/seed-1.6-flash")]
+LLM_MODEL = LLM_MODELS[0]  # Primary model (first in chain)
 
 # Aliases for backward compatibility
 OPENROUTER_API_KEY = LLM_API_KEY
 OPENROUTER_API_URL = LLM_API_URL
 OPENROUTER_MODEL   = LLM_MODEL
+
+# HTTP status codes that trigger fallback to next model
+# 404 included because OpenRouter returns it when a free model variant is retired
+_RETRYABLE_STATUS_CODES = {404, 429, 500, 502, 503, 504}
 
 MAX_CALLS_PER_CYCLE = 20
 DELAY_BETWEEN_CALLS = 1.5  # 1.5 second delay between calls for safety
@@ -134,87 +145,149 @@ Generate your thesis JSON now:"""
     return prompt
 
 
-# ── LLM API call ──────────────────────────────────────────────────────────────
+# ── LLM API call with Cascading Model Fallback ───────────────────────────────
 
-def _call_openrouter(prompt: str) -> dict | None:
+def _call_single_model(prompt: str, model: str) -> dict | None:
     """
-    Call OpenAI-compatible LLM API (OpenRouter, DeepSeek, Groq, etc.) and parse JSON response.
-    Returns parsed dict or None on failure.
+    Call a single OpenAI-compatible LLM model and parse JSON response.
+    Returns (parsed_dict, None) on success, or (None, error_info) on failure.
+    Raises _ModelRetryable for errors that should trigger fallback.
+    """
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        "HTTP-Referer": "https://github.com/Arthur-101/Option-Flow-Analyzer",
+        "X-Title": "Options Flow Analyzer",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1024,
+        "response_format": {"type": "json_object"}
+    }
+
+    resp = requests.post(
+        LLM_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Extract response content
+    text = data["choices"][0]["message"]["content"].strip()
+
+    # Strip markdown fences if present (some models still add them)
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    # Find JSON object if wrapped in other text
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start != -1 and end > start:
+        text = text[start:end]
+
+    return json.loads(text)
+
+
+def _call_llm(prompt: str) -> dict | None:
+    """
+    Cascading Model Fallback — tries each model in LLM_MODELS sequentially.
+
+    Falls back to the next model on:
+      - HTTP 429 (rate limited), 500/502/503/504 (server errors)
+      - Timeout / connection errors
+      - HTTP 400 (context length / bad request)
+      - Invalid JSON output from the model
+
+    Returns parsed thesis dict on success, or None if ALL models fail.
     """
     if not LLM_API_KEY:
         logger.error("LLM_API_KEY (or OPENROUTER_API_KEY) not set in .env")
         return None
 
-    headers = {
-        "Authorization": f"Bearer {LLM_API_KEY}",
-        "HTTP-Referer": "https://github.com/Arthur-101/Option-Flow-Analyzer",  # Optional - for rankings
-        "X-Title": "Options Flow Analyzer",  # Optional - shows in OpenRouter dashboard
-        "Content-Type": "application/json"
-    }
+    total = len(LLM_MODELS)
 
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1024,
-        "response_format": {"type": "json_object"}  # Force JSON output
-    }
+    for idx, model in enumerate(LLM_MODELS, 1):
+        try:
+            logger.info("[Model %d/%d] Trying %s...", idx, total, model)
+            result = _call_single_model(prompt, model)
+            logger.info("[Model %d/%d] ✅ %s responded successfully", idx, total, model)
+            return result
 
-    try:
-        resp = requests.post(
-            LLM_API_URL,
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            # Try to extract error message for logging
+            err_msg = ""
+            if e.response is not None:
+                try:
+                    err_msg = e.response.json().get("error", {}).get("message", "")[:200]
+                except Exception:
+                    err_msg = e.response.text[:200]
 
-        # Extract response content
-        text = data["choices"][0]["message"]["content"].strip()
+            if status in _RETRYABLE_STATUS_CODES:
+                logger.warning(
+                    "[Model %d/%d] ⚠️ %s returned HTTP %d (retryable): %s",
+                    idx, total, model, status, err_msg
+                )
+                # Continue to next model
+            elif status == 400:
+                logger.warning(
+                    "[Model %d/%d] ⚠️ %s returned HTTP 400 (bad request / context length): %s",
+                    idx, total, model, err_msg
+                )
+                # Continue to next model (might have larger context)
+            else:
+                # Non-retryable error (401 auth, 403 forbidden, etc.)
+                logger.error(
+                    "[Model %d/%d] ❌ %s returned HTTP %d (non-retryable): %s",
+                    idx, total, model, status, err_msg
+                )
+                return None  # Don't try other models — likely an API key issue
 
-        # Strip markdown fences if present (some models still add them)
-        if "```" in text:
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            logger.warning(
+                "[Model %d/%d] ⚠️ %s timed out or connection failed: %s",
+                idx, total, model, e
+            )
+            # Continue to next model
 
-        # Find JSON object if wrapped in other text
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start != -1 and end > start:
-            text = text[start:end]
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "[Model %d/%d] ⚠️ %s returned invalid JSON: %s",
+                idx, total, model, e
+            )
+            # Continue to next model (a different model may produce valid JSON)
 
-        return json.loads(text)
+        except (KeyError, IndexError) as e:
+            logger.warning(
+                "[Model %d/%d] ⚠️ %s response parse error: %s",
+                idx, total, model, e
+            )
+            # Continue to next model
 
-    except requests.RequestException as e:
-        logger.error("LLM API request failed (%s): %s", LLM_API_URL, e)
-        if hasattr(e, 'response') and e.response is not None:
-            try:
-                error_detail = e.response.json()
-                logger.error("Error details: %s", error_detail)
-            except:
-                logger.error("Response text: %s", e.response.text[:500])
-    except (KeyError, IndexError) as e:
-        logger.error("LLM response parse error: %s", e)
-    except json.JSONDecodeError as e:
-        logger.error("LLM returned invalid JSON: %s | Raw text: %s", e, text[:200])
+        except Exception as e:
+            logger.error(
+                "[Model %d/%d] ❌ %s unexpected error: %s",
+                idx, total, model, e
+            )
+            # Continue to next model
 
+    logger.error("All %d models in the fallback chain failed", total)
     return None
 
 
-# Function alias
-_call_llm = _call_openrouter
+# Backward-compatible alias
+_call_openrouter = _call_llm
 
 
 # ── DB write ───────────────────────────────────────────────────────────────────
@@ -247,6 +320,7 @@ def _write_thesis_to_db(signal_id: int, result: dict) -> None:
 def generate_theses(signals: list[dict], context: dict, headlines: list[str]) -> int:
     """
     Generate LLM theses for a list of signals.
+    Uses cascading model fallback — tries each model in LLM_MODELS sequentially.
     Writes results directly to signals table.
 
     Args:
@@ -263,6 +337,11 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
     if not LLM_API_KEY:
         logger.warning("LLM_API_KEY (or OPENROUTER_API_KEY) not set — skipping LLM thesis generation")
         return 0
+
+    logger.info(
+        "LLM Model Chain (%d models): %s",
+        len(LLM_MODELS), " → ".join(LLM_MODELS)
+    )
 
     # Rate limit: only process top N signals per cycle
     # Prioritise by signal_strength descending
@@ -281,7 +360,7 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
 
         try:
             prompt = _build_prompt(signal, context, headlines)
-            result = _call_openrouter(prompt)
+            result = _call_llm(prompt)
 
             if result:
                 _write_thesis_to_db(signal_id, result)
@@ -294,7 +373,7 @@ def generate_theses(signals: list[dict], context: dict, headlines: list[str]) ->
                     result.get("thesis", "")[:80] + "..."
                 )
             else:
-                logger.warning("No thesis generated for signal %d", signal_id)
+                logger.warning("No thesis generated for signal %d (all models failed)", signal_id)
 
             # Rate limiting delay (except after last call)
             if i < len(sorted_signals) - 1:
