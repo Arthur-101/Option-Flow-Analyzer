@@ -54,11 +54,12 @@ def get_signals(
     symbol: str = Query("NIFTY"),
     limit: int = Query(50),
     bias: Optional[str] = Query(None),
-    type: Optional[str] = Query(None)
+    type: Optional[str] = Query(None),
+    ranked: bool = Query(False)
 ):
     """Returns feed of detected anomaly signals with setup, strength, and AI theses."""
     try:
-        return api_service.get_signals_feed(symbol=symbol, limit=limit, bias_filter=bias, type_filter=type)
+        return api_service.get_signals_feed(symbol=symbol, limit=limit, bias_filter=bias, type_filter=type, ranked=ranked)
     except Exception as e:
         logger.error("Failed to fetch signals: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
