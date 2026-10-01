@@ -312,11 +312,11 @@ def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
         SELECT headline, source, published_at FROM news_raw
         ORDER BY fetched_at DESC LIMIT 3
     """).fetchall()
-    news = [{"headline": r["headline"], "time": ist_time_str(r["published_at"] or "")} for r in news_rows]
+    news = [{"headline": r["headline"], "time": ist_time_str(r["published_at"] or ""), "source": r["source"] or "ET Markets"} for r in news_rows]
     if not news:
         news = [
-            {"headline": "FII index futures positions show mild net long expansion", "time": "11:05"},
-            {"headline": "RBI monetary policy stance remains neutral-to-supportive", "time": "10:30"}
+            {"headline": "FII index futures positions show mild net long expansion", "time": "11:05", "source": "ET Markets"},
+            {"headline": "RBI monetary policy stance remains neutral-to-supportive", "time": "10:30", "source": "Moneycontrol"}
         ]
 
     confidence = int(sig["llm_confidence"] or 3)
@@ -588,20 +588,22 @@ def get_signals_feed(symbol: str = "NIFTY", limit: int = 50, bias_filter: Option
     for idx, r in enumerate(rows):
         # Calculate 1-5 star confidence rating accurately
         raw_conf = r["llm_confidence"]
-        str_val = float(r["signal_strength"] or 2.5)
+        raw_str = float(r["signal_strength"] or 2.5)
+        # Normalize strength score if raw was 0-100 percentile or z-score
+        if raw_str > 10.0 and raw_str <= 100.0:
+            str_val = 1.0 + (raw_str / 100.0) * 4.0
+        elif raw_str > 5.0 and raw_str <= 10.0:
+            str_val = raw_str / 2.0
+        elif raw_str > 100.0:
+            str_val = 5.0
+        else:
+            str_val = raw_str
+        str_val = min(5.0, max(1.0, round(str_val, 1)))
+
         if raw_conf is not None and int(raw_conf) > 0:
             conf = min(5, max(1, int(raw_conf)))
         else:
-            if str_val >= 12.0:
-                conf = 5
-            elif str_val >= 6.0:
-                conf = 4
-            elif str_val >= 3.5:
-                conf = 3
-            elif str_val >= 2.0:
-                conf = 2
-            else:
-                conf = 1
+            conf = min(5, max(1, int(round(str_val))))
 
         strike_val = f"{int(r['strike']):,}" if r["strike"] else "24,800"
         strike_label = f"{strike_val} {r['option_type'] or 'CE'}"
@@ -704,7 +706,14 @@ def get_signal_detail(signal_id: int) -> Optional[Dict[str, Any]]:
         "timestamp": r["fired_at"],
         "bias": (r["bias"] or "NEUTRAL").capitalize(),
         "setup": r["signal_type"],
-        "strength": round(float(r["signal_strength"] or 3.5), 1),
+        "strength": round(
+            min(5.0, max(1.0, 
+                (1.0 + (float(r["signal_strength"]) / 100.0) * 4.0) if float(r["signal_strength"] or 0) > 10.0 and float(r["signal_strength"] or 0) <= 100.0
+                else (float(r["signal_strength"]) / 2.0) if float(r["signal_strength"] or 0) > 5.0 and float(r["signal_strength"] or 0) <= 10.0
+                else 5.0 if float(r["signal_strength"] or 0) > 100.0
+                else float(r["signal_strength"] or 3.5)
+            )), 1
+        ),
         "confidence": conf,
         "stars": "★" * conf + "☆" * (5 - conf),
         "thesis": r["llm_thesis"] or "Significant institutional positioning observed. Volume and open interest divergence indicates directional momentum.",
