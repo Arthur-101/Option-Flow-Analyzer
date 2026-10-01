@@ -113,9 +113,11 @@ def _get_ribbon_from_supabase(symbol: str = "NIFTY") -> Optional[Dict[str, Any]]
             label = f"{th.strftime('%d %b')} · {dte}d"
             available_expiries.append({"expiry": th.isoformat(), "label": label, "dte": dte})
 
+        from holidays import is_market_holiday
+        is_hol, _ = is_market_holiday()
         now_utc = datetime.now(timezone.utc)
         now_ist = now_utc + timedelta(hours=5, minutes=30)
-        market_open = (now_ist.weekday() < 5) and (
+        market_open = (not is_hol) and (now_ist.weekday() < 5) and (
             (now_ist.hour > 9 or (now_ist.hour == 9 and now_ist.minute >= 15)) and
             (now_ist.hour < 15 or (now_ist.hour == 15 and now_ist.minute <= 30))
         )
