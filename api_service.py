@@ -35,9 +35,136 @@ def get_latest_session_date(symbol: str = "NIFTY") -> str:
     conn.close()
     return r["dt"] if r and r["dt"] else date.today().isoformat()
 
+# ── Supabase Cloud Client ──────────────────────────────────────────────────────
+import logging
+from pathlib import Path
+from supabase import create_client, Client
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_sb_client: Optional[Client] = None
+
+def get_supabase_client() -> Optional[Client]:
+    global _sb_client
+    if _sb_client is None and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            _sb_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            logger.warning("Supabase client init failed in api_service: %s", e)
+    return _sb_client
+
+
+def _get_ribbon_from_supabase(symbol: str = "NIFTY") -> Optional[Dict[str, Any]]:
+    sb = get_supabase_client()
+    if not sb:
+        return None
+    try:
+        res = sb.table("market_context").select("*").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+        if not res.data:
+            return None
+        mc = res.data[0]
+
+        # Recent spot entries for sparkline (last 20 entries)
+        history_res = sb.table("market_context").select("spot_price,timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(20).execute()
+        hist_rows = history_res.data or []
+        hist_rows.reverse()
+        spots = [float(r["spot_price"]) for r in hist_rows if r.get("spot_price")]
+
+        current_spot = float(mc["spot_price"])
+        open_spot = spots[0] if spots else current_spot
+        day_high = max(spots) if spots else current_spot
+        day_low = min(spots) if spots else current_spot
+        change_pts = current_spot - open_spot
+        change_pct = (change_pts / open_spot * 100) if open_spot else 0.0
+
+        if len(spots) > 16:
+            indices = np.linspace(0, len(spots) - 1, 16, dtype=int)
+            sparkline = [round(spots[i], 2) for i in indices]
+        else:
+            sparkline = [round(s, 2) for s in spots] if spots else [current_spot] * 10
+
+        latest_ts = mc["timestamp"]
+        try:
+            dt = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
+            dt_ist = dt + timedelta(hours=5, minutes=30)
+            latest_exact = dt_ist.strftime("%H:%M:%S IST")
+            latest_ist = dt_ist.strftime("%H:%M")
+        except Exception:
+            latest_exact = latest_ts[11:19] + " IST"
+            latest_ist = latest_ts[11:16]
+
+        today = date.today()
+        thursdays = []
+        for d in range(1, 40):
+            cand = today + timedelta(days=d)
+            if cand.weekday() == 3:
+                thursdays.append(cand)
+                if len(thursdays) == 3:
+                    break
+
+        available_expiries = []
+        for th in thursdays:
+            dte = (th - today).days
+            label = f"{th.strftime('%d %b')} · {dte}d"
+            available_expiries.append({"expiry": th.isoformat(), "label": label, "dte": dte})
+
+        now_utc = datetime.now(timezone.utc)
+        now_ist = now_utc + timedelta(hours=5, minutes=30)
+        market_open = (now_ist.weekday() < 5) and (
+            (now_ist.hour > 9 or (now_ist.hour == 9 and now_ist.minute >= 15)) and
+            (now_ist.hour < 15 or (now_ist.hour == 15 and now_ist.minute <= 30))
+        )
+
+        try:
+            dt_utc = datetime.fromisoformat(latest_ts.replace("Z", "+00:00"))
+            is_live = (now_utc - dt_utc).total_seconds() < 900
+        except Exception:
+            is_live = False
+
+        return {
+            "spot": round(current_spot, 2),
+            "change_pts": round(change_pts, 2),
+            "change_pct": round(change_pct, 2),
+            "day_high": round(day_high, 2),
+            "day_low": round(day_low, 2),
+            "vix": float(mc.get("vix") or 13.82),
+            "vix_change": float(mc.get("vix_change") or -0.25),
+            "sparkline": sparkline,
+            "pcr": float(mc.get("pcr") or 1.0),
+            "pcr_state": mc.get("pcr_state") or "Neutral",
+            "vwap": float(mc.get("vwap") or current_spot),
+            "rsi": float(mc.get("rsi") or 50.0),
+            "max_pain": float(mc.get("max_pain") or (round(current_spot / 100) * 100)),
+            "put_wall": float(mc.get("put_wall") or (round(current_spot / 100) * 100 - 200)),
+            "call_wall": float(mc.get("call_wall") or (round(current_spot / 100) * 100 + 200)),
+            "available_expiries": available_expiries,
+            "selected_expiry": available_expiries[0]["label"] if available_expiries else "08 Oct · 7d",
+            "market_open": market_open,
+            "is_live": is_live,
+            "session_date": latest_ts[:10],
+            "latest_timestamp": latest_ts,
+            "latest_ist": latest_ist,
+            "latest_exact_ist": latest_exact,
+            "ai_stance": mc.get("ai_stance") or "Neutral · 50",
+            "source": "supabase_market_context",
+        }
+    except Exception as e:
+        logger.warning("Error fetching market_context from Supabase: %s", e)
+        return None
+
+
 # ── 1. Top Ribbon Metrics ──────────────────────────────────────────────────────
 def get_ribbon_data(symbol: str = "NIFTY", session_date: Optional[str] = None) -> Dict[str, Any]:
+    # Check Supabase first for real-time cloud snapshot if in live mode
     if not session_date:
+        cloud_ribbon = _get_ribbon_from_supabase(symbol)
+        if cloud_ribbon:
+            return cloud_ribbon
         session_date = get_latest_session_date(symbol)
     
     conn = get_conn()
@@ -263,12 +390,37 @@ def get_ribbon_data(symbol: str = "NIFTY", session_date: Optional[str] = None) -
 
 # ── 2. AI Verdict Hero ────────────────────────────────────────────────────────
 def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
+    sig = None
+    news = []
+    sb = get_supabase_client()
+    if sb:
+        try:
+            res = (
+                sb.table("signals")
+                .select("*")
+                .eq("symbol", symbol)
+                .not_.is_("llm_thesis", "null")
+                .neq("llm_thesis", "")
+                .order("fired_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                sig = res.data[0]
+
+            news_res = sb.table("news_raw").select("headline,source,published_at").order("fetched_at", desc=True).limit(3).execute()
+            if news_res.data:
+                news = [{"headline": r["headline"], "time": ist_time_str(r.get("published_at") or ""), "source": r.get("source") or "ET Markets"} for r in news_res.data]
+        except Exception as e:
+            logger.warning("Supabase thesis check fallback: %s", e)
+
     conn = get_conn()
-    sig = conn.execute("""
-        SELECT * FROM signals
-        WHERE symbol = ? AND llm_thesis IS NOT NULL AND llm_thesis != ''
-        ORDER BY fired_at DESC LIMIT 1
-    """, (symbol,)).fetchone()
+    if not sig:
+        sig = conn.execute("""
+            SELECT * FROM signals
+            WHERE symbol = ? AND llm_thesis IS NOT NULL AND llm_thesis != ''
+            ORDER BY fired_at DESC LIMIT 1
+        """, (symbol,)).fetchone()
 
     ribbon = get_ribbon_data(symbol)
 
@@ -290,29 +442,40 @@ def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
                 "put_wall": ribbon.get("put_wall", 23800),
                 "call_wall": ribbon.get("call_wall", 24200),
             },
-            "news": [],
+            "news": news or [],
             "updated_at": ribbon.get("latest_ist", "11:40") + " IST",
         }
 
     # Count signals for the date of this thesis
     sig_date = sig["fired_at"][:10]
-    today_count = conn.execute("SELECT COUNT(*) FROM signals WHERE symbol = ? AND DATE(fired_at) = ?", (symbol, sig_date)).fetchone()[0]
+    try:
+        today_count = conn.execute("SELECT COUNT(*) FROM signals WHERE symbol = ? AND DATE(fired_at) = ?", (symbol, sig_date)).fetchone()[0]
+    except Exception:
+        today_count = 1
 
     # Similar setup win rate from backtest data
     setup = sig["signal_type"]
-    sim_row = conn.execute("""
-        SELECT COUNT(*) as total, SUM(CASE WHEN outcome_correct = 1 THEN 1 ELSE 0 END) as wins
-        FROM signals
-        WHERE signal_type = ? AND outcome_correct IS NOT NULL
-    """, (setup,)).fetchone()
+    sim_row = None
+    try:
+        sim_row = conn.execute("""
+            SELECT COUNT(*) as total, SUM(CASE WHEN outcome_correct = 1 THEN 1 ELSE 0 END) as wins
+            FROM signals
+            WHERE signal_type = ? AND outcome_correct IS NOT NULL
+        """, (setup,)).fetchone()
+    except Exception:
+        pass
     sim_win_rate = round((sim_row["wins"] / sim_row["total"] * 100), 1) if sim_row and sim_row["total"] > 0 else 54.0
 
     # Recent news around signal time
-    news_rows = conn.execute("""
-        SELECT headline, source, published_at FROM news_raw
-        ORDER BY fetched_at DESC LIMIT 3
-    """).fetchall()
-    news = [{"headline": r["headline"], "time": ist_time_str(r["published_at"] or ""), "source": r["source"] or "ET Markets"} for r in news_rows]
+    if not news:
+        try:
+            news_rows = conn.execute("""
+                SELECT headline, source, published_at FROM news_raw
+                ORDER BY fetched_at DESC LIMIT 3
+            """).fetchall()
+            news = [{"headline": r["headline"], "time": ist_time_str(r["published_at"] or ""), "source": r["source"] or "ET Markets"} for r in news_rows]
+        except Exception:
+            pass
     if not news:
         news = [
             {"headline": "FII index futures positions show mild net long expansion", "time": "11:05", "source": "ET Markets"},
@@ -566,23 +729,44 @@ def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
 
 # ── 3. Signals Feed ────────────────────────────────────────────────────────────
 def get_signals_feed(symbol: str = "NIFTY", limit: int = 50, bias_filter: Optional[str] = None, type_filter: Optional[str] = None, ranked: bool = False) -> List[Dict[str, Any]]:
-    conn = get_conn()
-    q = "SELECT * FROM signals WHERE symbol = ?"
-    params: list = [symbol]
-    if bias_filter and bias_filter != "ALL":
-        q += " AND bias = ?"
-        params.append(bias_filter)
-    if type_filter and type_filter != "ALL":
-        q += " AND signal_type = ?"
-        params.append(type_filter)
-    
-    if ranked:
-        q += " ORDER BY signal_strength DESC, id DESC LIMIT ?"
-    else:
-        q += " ORDER BY fired_at DESC LIMIT ?"
-    params.append(limit)
+    rows = []
+    sb = get_supabase_client()
+    if sb:
+        try:
+            q = sb.table("signals").select("*").eq("symbol", symbol)
+            if bias_filter and bias_filter != "ALL":
+                q = q.eq("bias", bias_filter)
+            if type_filter and type_filter != "ALL":
+                q = q.eq("signal_type", type_filter)
+            if ranked:
+                q = q.order("signal_strength", desc=True)
+            else:
+                q = q.order("fired_at", desc=True)
+            res = q.limit(limit).execute()
+            if res.data and len(res.data) > 0:
+                rows = res.data
+        except Exception as e:
+            logger.warning("Supabase signals feed error: %s", e)
 
-    rows = conn.execute(q, params).fetchall()
+    if not rows:
+        conn = get_conn()
+        q = "SELECT * FROM signals WHERE symbol = ?"
+        params: list = [symbol]
+        if bias_filter and bias_filter != "ALL":
+            q += " AND bias = ?"
+            params.append(bias_filter)
+        if type_filter and type_filter != "ALL":
+            q += " AND signal_type = ?"
+            params.append(type_filter)
+        
+        if ranked:
+            q += " ORDER BY signal_strength DESC, id DESC LIMIT ?"
+        else:
+            q += " ORDER BY fired_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = conn.execute(q, params).fetchall()
+        conn.close()
 
     results = []
     for idx, r in enumerate(rows):
