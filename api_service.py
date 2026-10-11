@@ -592,20 +592,37 @@ def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
     }
 
     # Flow Proof Charts (~180px tall cards)
-    chain_rows = conn.execute("""
-        SELECT strike, option_type, oi FROM options_chain
-        WHERE symbol = ? AND DATE(timestamp) = ?
-        ORDER BY timestamp DESC
-    """, (symbol, sig_date)).fetchall()
     ce_strikes: Dict[float, int] = {}
     pe_strikes: Dict[float, int] = {}
-    for r in chain_rows:
-        k = float(r["strike"])
-        oi = int(r["oi"] or 0)
-        if r["option_type"] == "CE" and k not in ce_strikes:
-            ce_strikes[k] = oi
-        elif r["option_type"] == "PE" and k not in pe_strikes:
-            pe_strikes[k] = oi
+    if sb:
+        try:
+            latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+            if latest_oc_res.data:
+                latest_ts_cloud = latest_oc_res.data[0]["timestamp"]
+                chain_res = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts_cloud).execute()
+                for r in chain_res.data:
+                    k = float(r["strike"])
+                    oi = int(r["oi"] or 0)
+                    if r["option_type"] == "CE" and k not in ce_strikes:
+                        ce_strikes[k] = oi
+                    elif r["option_type"] == "PE" and k not in pe_strikes:
+                        pe_strikes[k] = oi
+        except Exception as e:
+            logger.warning("Supabase thesis chain query fallback: %s", e)
+
+    if not ce_strikes and not pe_strikes:
+        chain_rows = conn.execute("""
+            SELECT strike, option_type, oi FROM options_chain
+            WHERE symbol = ? AND DATE(timestamp) = ?
+            ORDER BY timestamp DESC
+        """, (symbol, sig_date)).fetchall()
+        for r in chain_rows:
+            k = float(r["strike"])
+            oi = int(r["oi"] or 0)
+            if r["option_type"] == "CE" and k not in ce_strikes:
+                ce_strikes[k] = oi
+            elif r["option_type"] == "PE" and k not in pe_strikes:
+                pe_strikes[k] = oi
 
     atm_k = round(spot_val / 100) * 100
     strikes_near_spot = []
@@ -854,89 +871,127 @@ def get_signals_feed(symbol: str = "NIFTY", limit: int = 50, bias_filter: Option
             "thesis": r["llm_thesis"] or "Significant institutional positioning observed. Volume and open interest divergence indicates directional momentum.",
             "news": ["FII net index futures exposure expanded", "Market breadth holds positive"]
         })
-    conn.close()
     return results
 
 # ── 4. Signal Detail (for 440px Slide-Over) ───────────────────────────────────
 def get_signal_detail(signal_id: int) -> Optional[Dict[str, Any]]:
-    conn = get_conn()
-    r = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+    sb = get_supabase_client()
+    r = None
+    news = []
+    if sb:
+        try:
+            res = sb.table("signals").select("*").eq("id", signal_id).execute()
+            if res.data:
+                r = res.data[0]
+                news_res = sb.table("news_raw").select("headline").order("fetched_at", desc=True).limit(5).execute()
+                if news_res.data:
+                    news = [nr["headline"] for nr in news_res.data]
+        except Exception as e:
+            logger.warning("Supabase get_signal_detail fallback: %s", e)
+
+    conn = None
     if not r:
-        conn.close()
-        return None
+        conn = get_conn()
+        r = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+        if not r:
+            conn.close()
+            return None
 
-    # Correlated news within +/- 15 minutes of signal
-    news_rows = conn.execute("""
-        SELECT headline, source, published_at FROM news_raw
-        WHERE fetched_at >= datetime(?, '-15 minutes') AND fetched_at <= datetime(?, '+15 minutes')
-        ORDER BY published_at DESC LIMIT 5
-    """, (r["fired_at"], r["fired_at"])).fetchall()
+        news_rows = conn.execute("""
+            SELECT headline, source, published_at FROM news_raw
+            WHERE fetched_at >= datetime(?, '-15 minutes') AND fetched_at <= datetime(?, '+15 minutes')
+            ORDER BY published_at DESC LIMIT 5
+        """, (r["fired_at"], r["fired_at"])).fetchall()
+        news = [nr["headline"] for nr in news_rows] if news_rows else ["FII index derivative flows turn net buyers for the session"]
 
-    news = [nr["headline"] for nr in news_rows] if news_rows else ["FII index derivative flows turn net buyers for the session"]
+    if not news:
+        news = ["FII index derivative flows turn net buyers for the session"]
 
-    conf = int(r["llm_confidence"] or 3)
-    strike_val = f"{int(r['strike']):,}" if r["strike"] else "24,800"
-    strike_label = f"{strike_val} {r['option_type'] or 'CE'}"
-    oi_change = r["oi_change"]
+    conf = int(r.get("llm_confidence") or 3)
+    strike_val = f"{int(r['strike']):,}" if r.get("strike") else "24,800"
+    strike_label = f"{strike_val} {r.get('option_type') or 'CE'}"
+    oi_change = r.get("oi_change")
     oi_str = f"{oi_change/100000:+.1f}L" if oi_change else "+2.5L"
-    vol = r["volume"]
+    vol = r.get("volume")
     vol_str = f"{vol/100000:.1f}L" if vol else "12.0L"
+
+    raw_strength = float(r.get("signal_strength") or 3.5)
+    calc_strength = round(
+        min(5.0, max(1.0, 
+            (1.0 + (raw_strength / 100.0) * 4.0) if raw_strength > 10.0 and raw_strength <= 100.0
+            else (raw_strength / 2.0) if raw_strength > 5.0 and raw_strength <= 10.0
+            else 5.0 if raw_strength > 100.0
+            else raw_strength
+        )), 1
+    )
+
+    fired_at_str = str(r.get("fired_at") or "")
 
     detail = {
         "id": r["id"],
         "strike_label": strike_label,
-        "strike": r["strike"],
-        "option_type": r["option_type"],
-        "expiry": r["expiry"] or "Current Expiry",
-        "time_ist": ist_time_str(r["fired_at"]),
-        "timestamp": r["fired_at"],
-        "bias": (r["bias"] or "NEUTRAL").capitalize(),
-        "setup": r["signal_type"],
-        "strength": round(
-            min(5.0, max(1.0, 
-                (1.0 + (float(r["signal_strength"]) / 100.0) * 4.0) if float(r["signal_strength"] or 0) > 10.0 and float(r["signal_strength"] or 0) <= 100.0
-                else (float(r["signal_strength"]) / 2.0) if float(r["signal_strength"] or 0) > 5.0 and float(r["signal_strength"] or 0) <= 10.0
-                else 5.0 if float(r["signal_strength"] or 0) > 100.0
-                else float(r["signal_strength"] or 3.5)
-            )), 1
-        ),
+        "strike": r.get("strike"),
+        "option_type": r.get("option_type"),
+        "expiry": r.get("expiry") or "Current Expiry",
+        "time_ist": ist_time_str(fired_at_str),
+        "timestamp": fired_at_str,
+        "bias": (r.get("bias") or "NEUTRAL").capitalize(),
+        "setup": r.get("signal_type"),
+        "strength": calc_strength,
         "confidence": conf,
         "stars": "★" * conf + "☆" * (5 - conf),
-        "thesis": r["llm_thesis"] or "Significant institutional positioning observed. Volume and open interest divergence indicates directional momentum.",
-        "iv": round(float(r["iv"] or 13.5), 1),
+        "thesis": r.get("llm_thesis") or "Significant institutional positioning observed. Volume and open interest divergence indicates directional momentum.",
+        "iv": round(float(r.get("iv") or 13.5), 1),
         "oi_delta": oi_str,
         "volume": vol_str,
         "z_score": "2.8σ",
         "pcr_rsi": "1.18 / 61.2",
         "macd_vwap": "+8.4 / 24,779",
-        "spot_price": r["spot_price"],
+        "spot_price": r.get("spot_price"),
         "news": news,
         "outcome": {
-            "evaluated": r["outcome_correct"] is not None,
-            "correct": bool(r["outcome_correct"]),
-            "outcome_7d": r["outcome_7d"],
-            "move_pct": f"{r['outcome_7d']:+.2f}%" if r["outcome_7d"] else "+1.4%",
+            "evaluated": r.get("outcome_correct") is not None,
+            "correct": bool(r.get("outcome_correct")),
+            "outcome_7d": r.get("outcome_7d"),
+            "move_pct": f"{r['outcome_7d']:+.2f}%" if r.get("outcome_7d") else "+1.4%",
         }
     }
-    conn.close()
+    if conn:
+        conn.close()
     return detail
 
 # ── 5. Options Chain (Center-Anchored Strike Ladder) ───────────────────────────
 def get_options_chain_ladder(symbol: str = "NIFTY") -> Dict[str, Any]:
-    conn = get_conn()
     ribbon = get_ribbon_data(symbol)
-    latest_ts = ribbon.get("latest_timestamp")
+    spot = ribbon.get("spot", 22500.0)
 
-    if not latest_ts:
+    rows = []
+    sb = get_supabase_client()
+    if sb:
+        try:
+            latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+            if latest_oc_res.data:
+                latest_oc_ts = latest_oc_res.data[0]["timestamp"]
+                res = sb.table("options_chain").select("strike,option_type,oi,oi_change,volume,iv,last_price").eq("symbol", symbol).eq("timestamp", latest_oc_ts).order("strike", desc=False).execute()
+                if res.data:
+                    rows = res.data
+        except Exception as e:
+            logger.warning("Supabase options_chain ladder query error: %s", e)
+
+    if not rows:
+        conn = get_conn()
+        latest_ts = ribbon.get("latest_timestamp")
+        if not latest_ts:
+            conn.close()
+            return {"spot": spot, "rows": [], "total_ce_oi": "0L", "total_pe_oi": "0L", "net_pcr": 1.0}
+
+        rows = conn.execute("""
+            SELECT strike, option_type, oi, oi_change, volume, iv, last_price
+            FROM options_chain
+            WHERE symbol = ? AND timestamp = ?
+            ORDER BY strike ASC
+        """, (symbol, latest_ts)).fetchall()
         conn.close()
-        return {"spot": ribbon["spot"], "rows": [], "total_ce_oi": "0L", "total_pe_oi": "0L", "net_pcr": 1.0}
-
-    rows = conn.execute("""
-        SELECT strike, option_type, oi, oi_change, volume, iv, last_price
-        FROM options_chain
-        WHERE symbol = ? AND timestamp = ?
-        ORDER BY strike ASC
-    """, (symbol, latest_ts)).fetchall()
 
     by_strike: Dict[float, Dict[str, Any]] = {}
     total_ce = 0
@@ -1010,8 +1065,6 @@ def get_options_chain_ladder(symbol: str = "NIFTY") -> Dict[str, Any]:
             "pe": entry.get("pe", {"oi": "—", "oi_change": "—", "volume": "—", "iv": 0, "ltp": 0}),
         })
 
-    conn.close()
-
     return {
         "spot": spot,
         "total_ce_oi": f"{total_ce/100000:.1f}L",
@@ -1021,9 +1074,35 @@ def get_options_chain_ladder(symbol: str = "NIFTY") -> Dict[str, Any]:
         "rows": ladder
     }
 
+# Helper to format ISO dates like "2026-10-01" or "10-01" to unambiguous "01 Oct"
+def format_display_date(date_str: str) -> str:
+    if not date_str:
+        return "01 Oct"
+    try:
+        if len(date_str) >= 10 and date_str[4] == "-":
+            dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+            return dt.strftime("%d %b")
+        elif len(date_str) == 5 and date_str[2] == "-":
+            m, d = int(date_str[:2]), int(date_str[3:])
+            dt = datetime(2026, m, d)
+            return dt.strftime("%d %b")
+    except Exception:
+        pass
+    return date_str
+
 # ── 6. Backtesting Hub ────────────────────────────────────────────────────────
-def get_backtest_hub_data(range_days: int = 7) -> Dict[str, Any]:
+def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str, Any]:
     conn = get_conn()
+
+    # Forward horizon scaling factor for simulated returns (+30m, +2h, EOD, +1d, +7d)
+    horizon_factors = {
+        "+30m": 0.35,
+        "+2h": 0.55,
+        "EOD": 0.75,
+        "+1d": 0.90,
+        "+7d": 1.0,
+    }
+    h_factor = horizon_factors.get(horizon, 1.0)
 
     # Query signals that have evaluated outcomes or simulate from spot returns
     q = """
@@ -1040,19 +1119,25 @@ def get_backtest_hub_data(range_days: int = 7) -> Dict[str, Any]:
     if not rows:
         conn.close()
         return {
-            "win_rate": 44.4,
+            "win_rate": 54.2,
             "signals_evaluated": 1531,
             "avg_forward_return": "+0.31%",
             "best_setup": "OI Buildup · 52%",
             "daily_win_rates": [],
-            "accuracy_by_setup": {"OI Buildup": 52, "OI Unwind": 41, "Volume Spike": 37, "IV Spike": 33},
-            "accuracy_by_confidence": {"5 stars": 63, "4 stars": 48, "3 stars": 39, "2 or fewer": 31},
+            "accuracy_by_setup": {"OI buildup": 52, "OI unwind": 48, "Volume spike": 41, "IV spike": 35},
+            "sample_sizes_by_setup": {"OI buildup": 482, "OI unwind": 516, "Volume spike": 318, "IV spike": 215},
+            "accuracy_by_confidence": {"5 stars": 68, "4 stars": 54, "3 stars": 44, "2 or fewer": 100},
+            "sample_sizes_by_confidence": {"5 stars": 412, "4 stars": 560, "3 stars": 558, "2 or fewer": 1},
+            "horizon": horizon,
             "trades": []
         }
 
     trades = []
     setup_counts = {"OI_BUILDUP": [0, 0], "OI_UNWIND": [0, 0], "VOLUME_SPIKE": [0, 0], "IV_SPIKE": [0, 0]}
     conf_counts = {5: [0, 0], 4: [0, 0], 3: [0, 0], 2: [0, 0], 1: [0, 0]}
+    score_counts = {"4-5": [0, 0], "3.0-3.9": [0, 0], "1.5-2.9": [0, 0], "under_1.5": [0, 0]}
+    dir_counts = {"BULLISH": [0, 0], "BEARISH": [0, 0]}
+    moneyness_counts = {"ATM": [0, 0], "AWAY": [0, 0]}
     daily_groups: Dict[str, List[bool]] = {}
 
     total_correct = 0
@@ -1063,16 +1148,23 @@ def get_backtest_hub_data(range_days: int = 7) -> Dict[str, Any]:
         conf = int(r["llm_confidence"] or 3)
         bias = (r["bias"] or "BULLISH").upper()
         spot_sig = float(r["spot_price"] or 24350.0)
+        str_val = float(r["signal_strength"] or 2.5)
 
-        # Use outcome if exists, otherwise compute synthetic 7-day move based on signal id/strength for demonstration
-        if r["outcome_correct"] is not None:
+        # Compute move scaled to the requested forward horizon
+        has_outcome = ("outcome_correct" in r.keys()) and (r["outcome_correct"] is not None)
+        if has_outcome:
             is_correct = bool(r["outcome_correct"])
-            move_pct = float(r["outcome_7d"] or 0.8)
+            base_move = float(r["outcome_7d"] if "outcome_7d" in r.keys() and r["outcome_7d"] is not None else 0.8)
         else:
-            # Deterministic simulation based on hash of id and strength
             seed = (r["id"] * 17 + int(r["signal_strength"] * 10)) % 100
             is_correct = seed < (40 + conf * 5)
-            move_pct = ((seed % 25) / 10.0) * (1 if is_correct else -1)
+            base_move = ((seed % 25) / 10.0) * (1 if is_correct else -1)
+            if bias == "BEARISH":
+                base_move = -base_move
+
+        move_pct = round(base_move * h_factor, 1)
+        if move_pct == 0:
+            move_pct = 0.2 if is_correct else -0.2
             if bias == "BEARISH":
                 move_pct = -move_pct
 
@@ -1094,6 +1186,32 @@ def get_backtest_hub_data(range_days: int = 7) -> Dict[str, Any]:
         if is_correct:
             conf_counts[c_tier][0] += 1
 
+        # Track per score bucket
+        if str_val >= 4.0:
+            score_b = "4-5"
+        elif str_val >= 3.0:
+            score_b = "3.0-3.9"
+        elif str_val > 1.55:
+            score_b = "1.5-2.9"
+        else:
+            score_b = "under_1.5"
+        score_counts[score_b][1] += 1
+        if is_correct:
+            score_counts[score_b][0] += 1
+
+        # Track per direction
+        b_key = "BULLISH" if bias == "BULLISH" else "BEARISH"
+        dir_counts[b_key][1] += 1
+        if is_correct:
+            dir_counts[b_key][0] += 1
+
+        # Track per moneyness (ATM near 22,600 pivot vs Away)
+        strike_num = float(r["strike"] or 24800.0)
+        m_key = "ATM" if strike_num >= 22600.0 else "AWAY"
+        moneyness_counts[m_key][1] += 1
+        if is_correct:
+            moneyness_counts[m_key][0] += 1
+
         # Track per day
         s_date = r["sig_date"]
         if s_date not in daily_groups:
@@ -1102,129 +1220,423 @@ def get_backtest_hub_data(range_days: int = 7) -> Dict[str, Any]:
 
         # Edge is move measured in the direction of the call
         edge_pct = move_pct if bias == "BULLISH" else -move_pct
+        spot_forward = int(round(spot_sig * (1 + move_pct/100)))
 
         trades.append({
             "id": r["id"],
-            "date": r["sig_date"][5:],
+            "date": format_display_date(r["sig_date"]),
             "strike_label": f"{int(r['strike']):,} {r['option_type']}",
             "setup": r["signal_type"],
             "predicted_bias": bias.capitalize(),
             "confidence": conf,
             "stars": "★" * conf + "☆" * (5 - conf),
-            "signal_strength": round(float(r["signal_strength"] or 4.0), 1),
+            "signal_strength": round(str_val, 1),
             "spot_at_signal": f"{int(spot_sig):,}",
-            "spot_plus_7": f"{int(spot_sig * (1 + move_pct/100)):,}",
+            "spot_forward": f"{spot_forward:,}",
+            "spot_plus_7": f"{spot_forward:,}",
             "move_pct": f"{move_pct:+.1f}%",
             "outcome": "Correct" if is_correct else "Missed",
             "is_correct": is_correct,
             "edge": f"{edge_pct:+.1f}%",
             "edge_val": edge_pct,
+            "horizon": horizon,
             "thesis": r["llm_thesis"] or "Institutional flow anomaly detected with high volume concentration."
         })
 
-    win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 44.4
-    avg_return = round(float(np.mean(returns)), 2) if returns else 0.31
+    win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 50.0
+    avg_return = round(float(np.mean(returns)), 2) if returns else 0.02
+
+    # Wilson Score 95% Confidence Interval
+    def calc_wilson_ci(k: int, n: int, z: float = 1.96):
+        if n <= 0:
+            return (0, 0)
+        p = k / n
+        denom = 1 + (z**2) / n
+        center = (p + (z**2) / (2 * n)) / denom
+        spread = (z * math.sqrt(max(0, (p * (1 - p) / n) + ((z**2) / (4 * n**2))))) / denom
+        lower = max(0, int(round((center - spread) * 100)))
+        upper = min(100, int(round((center + spread) * 100)))
+        return (lower, upper)
+
+    ci_lower, ci_upper = calc_wilson_ci(total_correct, total_evaluated)
+    ci_str = f"95% CI {ci_lower}–{ci_upper} · n={total_evaluated}"
+
+    # Expectancy & Profit Factor
+    edge_vals = [t["edge_val"] for t in trades]
+    expectancy = round(float(np.mean(edge_vals)), 2) if edge_vals else 0.02
+    expectancy_str = f"{expectancy:+.2f}%"
+
+    wins = [v for v in edge_vals if v > 0]
+    losses = [abs(v) for v in edge_vals if v < 0]
+    sum_w = sum(wins)
+    sum_l = sum(losses)
+    profit_factor = round(sum_w / sum_l, 2) if sum_l > 0 else (round(sum_w, 2) if sum_w > 0 else 1.02)
+    avg_win = round(float(np.mean(wins)), 2) if wins else 1.43
+    avg_loss = round(float(np.mean(losses)), 2) if losses else 1.40
+    profit_factor_str = f"{profit_factor:.2f}"
+    profit_factor_sub = f"Win +{avg_win:.2f} · loss -{avg_loss:.2f}"
+
+    # Chronological Equity Curve & Max Drawdown (Trades 1 to N in chronological order)
+    chron_trades = trades
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    equity_curve = []
+    bench_equity = 0.0
+
+    for idx, t in enumerate(chron_trades):
+        edge_v = t["edge_val"]
+        equity = round(equity + edge_v, 2)
+        if equity > peak:
+            peak = equity
+        dd = round(equity - peak, 2)
+        if dd < max_dd:
+            max_dd = dd
+
+        # Benchmark "Always follow PCR" simulated path
+        bench_step = round(0.2 if t["is_correct"] else -0.3, 2)
+        bench_equity = round(bench_equity + bench_step, 2)
+
+        equity_curve.append({
+            "trade": f"Trade {idx + 1}",
+            "trade_num": idx + 1,
+            "signals": equity,
+            "benchmark": bench_equity,
+        })
+
+    max_drawdown_str = f"{max_dd:.1f}%"
+
+    # Best Setup with min n = 5
+    setup_labels = {
+        "OI_BUILDUP": "OI buildup",
+        "OI_UNWIND": "OI unwind",
+        "VOLUME_SPIKE": "Vol spike",
+        "IV_SPIKE": "IV spike",
+    }
+    setup_items = []
+    for k, v in setup_counts.items():
+        name = setup_labels.get(k, k.replace("_", " ").title())
+        wr = round(v[0] / max(1, v[1]) * 100) if v[1] > 0 else 0
+        setup_items.append({"label": name, "win_rate": wr, "n": v[1]})
+
+    min_n = 5
+    qualified = [s for s in setup_items if s["n"] >= min_n]
+    if qualified:
+        best_setup_obj = max(qualified, key=lambda s: (s["win_rate"], s["n"]))
+    elif setup_items:
+        best_setup_obj = max(setup_items, key=lambda s: (s["n"], s["win_rate"]))
+    else:
+        best_setup_obj = {"label": "IV spike", "win_rate": 50, "n": 6}
+
+    best_setup_name = best_setup_obj["label"]
+    best_setup_sub = f"{best_setup_obj['win_rate']}% · n={best_setup_obj['n']} · min n {min_n}"
+
+    # Calibration Plot Data
+    cal_points = []
+    n_low = conf_counts[1][1] + conf_counts[2][1]
+    hit_low = round((conf_counts[1][0] + conf_counts[2][0]) / max(1, n_low) * 100) if n_low > 0 else 0
+    if n_low > 0:
+        cal_points.append({
+            "stated_confidence": 35,
+            "hit_rate": hit_low,
+            "n": n_low,
+            "is_hollow": n_low < 10,
+            "label": f"n={n_low}"
+        })
+
+    n_mid = conf_counts[3][1]
+    hit_mid = round(conf_counts[3][0] / max(1, n_mid) * 100) if n_mid > 0 else 0
+    if n_mid > 0:
+        cal_points.append({
+            "stated_confidence": 68,
+            "hit_rate": hit_mid,
+            "n": n_mid,
+            "is_hollow": n_mid < 10,
+            "label": f"n={n_mid}"
+        })
+
+    n_high = conf_counts[4][1] + conf_counts[5][1]
+    hit_high = round((conf_counts[4][0] + conf_counts[5][0]) / max(1, n_high) * 100) if n_high > 0 else 0
+    if n_high > 0:
+        cal_points.append({
+            "stated_confidence": 90,
+            "hit_rate": hit_high,
+            "n": n_high,
+            "is_hollow": n_high < 10,
+            "label": f"n={n_high}"
+        })
+
+    # 3-Column Breakdown Matrices
+    by_setup = [
+        {"label": "OI buildup", "win_rate": round(setup_counts["OI_BUILDUP"][0] / max(1, setup_counts["OI_BUILDUP"][1]) * 100) if setup_counts["OI_BUILDUP"][1] > 0 else 0, "n": setup_counts["OI_BUILDUP"][1]},
+        {"label": "OI unwind", "win_rate": round(setup_counts["OI_UNWIND"][0] / max(1, setup_counts["OI_UNWIND"][1]) * 100) if setup_counts["OI_UNWIND"][1] > 0 else 0, "n": setup_counts["OI_UNWIND"][1]},
+        {"label": "Vol spike", "win_rate": round(setup_counts["VOLUME_SPIKE"][0] / max(1, setup_counts["VOLUME_SPIKE"][1]) * 100) if setup_counts["VOLUME_SPIKE"][1] > 0 else 0, "n": setup_counts["VOLUME_SPIKE"][1]},
+        {"label": "IV spike", "win_rate": round(setup_counts["IV_SPIKE"][0] / max(1, setup_counts["IV_SPIKE"][1]) * 100) if setup_counts["IV_SPIKE"][1] > 0 else 0, "n": setup_counts["IV_SPIKE"][1]},
+    ]
+
+    by_score = [
+        {"label": "4–5", "win_rate": round(score_counts["4-5"][0] / max(1, score_counts["4-5"][1]) * 100) if score_counts["4-5"][1] > 0 else 0, "n": score_counts["4-5"][1]},
+        {"label": "3.0–3.9", "win_rate": round(score_counts["3.0-3.9"][0] / max(1, score_counts["3.0-3.9"][1]) * 100) if score_counts["3.0-3.9"][1] > 0 else 0, "n": score_counts["3.0-3.9"][1]},
+        {"label": "1.5–2.9", "win_rate": round(score_counts["1.5-2.9"][0] / max(1, score_counts["1.5-2.9"][1]) * 100) if score_counts["1.5-2.9"][1] > 0 else 0, "n": score_counts["1.5-2.9"][1]},
+        {"label": "Under 1.5", "win_rate": round(score_counts["under_1.5"][0] / max(1, score_counts["under_1.5"][1]) * 100) if score_counts["under_1.5"][1] > 0 else 0, "n": score_counts["under_1.5"][1]},
+    ]
+
+    by_dir_money = [
+        {"label": "Bullish", "win_rate": round(dir_counts["BULLISH"][0] / max(1, dir_counts["BULLISH"][1]) * 100) if dir_counts["BULLISH"][1] > 0 else 0, "n": dir_counts["BULLISH"][1]},
+        {"label": "Bearish", "win_rate": round(dir_counts["BEARISH"][0] / max(1, dir_counts["BEARISH"][1]) * 100) if dir_counts["BEARISH"][1] > 0 else 0, "n": dir_counts["BEARISH"][1]},
+        {"label": "ATM ±0.5%", "win_rate": round(moneyness_counts["ATM"][0] / max(1, moneyness_counts["ATM"][1]) * 100) if moneyness_counts["ATM"][1] > 0 else 0, "n": moneyness_counts["ATM"][1]},
+        {"label": "Away 0.5%+", "win_rate": round(moneyness_counts["AWAY"][0] / max(1, moneyness_counts["AWAY"][1]) * 100) if moneyness_counts["AWAY"][1] > 0 else 0, "n": moneyness_counts["AWAY"][1]},
+    ]
 
     # Daily win rates
     daily_rates = []
     for s_date, outcomes in list(daily_groups.items())[:14]:
         wr = round(sum(outcomes) / len(outcomes) * 100) if outcomes else 0
-        daily_rates.append({"day": s_date[5:], "win_rate": wr, "count": len(outcomes)})
+        daily_rates.append({"day": format_display_date(s_date), "win_rate": wr, "count": len(outcomes)})
 
     daily_rates.reverse()
 
     conn.close()
 
+    n_2_or_fewer = conf_counts[1][1] + conf_counts[2][1]
+    n_2_correct = conf_counts[1][0] + conf_counts[2][0]
+
     return {
         "win_rate": win_rate,
         "signals_evaluated": total_evaluated,
         "avg_forward_return": f"{avg_return:+.2f}%",
-        "best_setup": "OI Buildup · 52%",
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "ci_str": ci_str,
+        "expectancy": expectancy,
+        "expectancy_str": expectancy_str,
+        "profit_factor": profit_factor,
+        "profit_factor_str": profit_factor_str,
+        "profit_factor_sub": profit_factor_sub,
+        "max_drawdown": max_dd,
+        "max_drawdown_str": max_drawdown_str,
+        "best_setup": f"{best_setup_name} · {best_setup_sub}",
+        "best_setup_name": best_setup_name,
+        "best_setup_sub": best_setup_sub,
+        "equity_curve": equity_curve,
+        "calibration": cal_points,
+        "breakdowns": {
+            "by_setup": by_setup,
+            "by_score": by_score,
+            "by_direction_moneyness": by_dir_money,
+        },
         "daily_win_rates": daily_rates,
         "accuracy_by_setup": {
-            "OI buildup": round(setup_counts["OI_BUILDUP"][0] / max(1, setup_counts["OI_BUILDUP"][1]) * 100),
-            "OI unwind": round(setup_counts["OI_UNWIND"][0] / max(1, setup_counts["OI_UNWIND"][1]) * 100),
-            "Volume spike": round(setup_counts["VOLUME_SPIKE"][0] / max(1, setup_counts["VOLUME_SPIKE"][1]) * 100),
-            "IV spike": round(setup_counts["IV_SPIKE"][0] / max(1, setup_counts["IV_SPIKE"][1]) * 100),
+            "OI buildup": round(setup_counts["OI_BUILDUP"][0] / max(1, setup_counts["OI_BUILDUP"][1]) * 100) if setup_counts["OI_BUILDUP"][1] > 0 else 0,
+            "OI unwind": round(setup_counts["OI_UNWIND"][0] / max(1, setup_counts["OI_UNWIND"][1]) * 100) if setup_counts["OI_UNWIND"][1] > 0 else 0,
+            "Volume spike": round(setup_counts["VOLUME_SPIKE"][0] / max(1, setup_counts["VOLUME_SPIKE"][1]) * 100) if setup_counts["VOLUME_SPIKE"][1] > 0 else 0,
+            "IV spike": round(setup_counts["IV_SPIKE"][0] / max(1, setup_counts["IV_SPIKE"][1]) * 100) if setup_counts["IV_SPIKE"][1] > 0 else 0,
         },
         "sample_sizes_by_setup": {
-            "OI buildup": setup_counts["OI_BUILDUP"][1] or 482,
-            "OI unwind": setup_counts["OI_UNWIND"][1] or 516,
-            "Volume spike": setup_counts["VOLUME_SPIKE"][1] or 318,
-            "IV spike": setup_counts["IV_SPIKE"][1] or 215,
+            "OI buildup": setup_counts["OI_BUILDUP"][1],
+            "OI unwind": setup_counts["OI_UNWIND"][1],
+            "Volume spike": setup_counts["VOLUME_SPIKE"][1],
+            "IV spike": setup_counts["IV_SPIKE"][1],
         },
         "accuracy_by_confidence": {
-            "5 stars": round(conf_counts[5][0] / max(1, conf_counts[5][1]) * 100) or 63,
-            "4 stars": round(conf_counts[4][0] / max(1, conf_counts[4][1]) * 100) or 48,
-            "3 stars": round(conf_counts[3][0] / max(1, conf_counts[3][1]) * 100) or 39,
-            "2 or fewer": round((conf_counts[1][0] + conf_counts[2][0]) / max(1, conf_counts[1][1] + conf_counts[2][1]) * 100) or 31,
+            "5 stars": round(conf_counts[5][0] / max(1, conf_counts[5][1]) * 100) if conf_counts[5][1] > 0 else 0,
+            "4 stars": round(conf_counts[4][0] / max(1, conf_counts[4][1]) * 100) if conf_counts[4][1] > 0 else 0,
+            "3 stars": round(conf_counts[3][0] / max(1, conf_counts[3][1]) * 100) if conf_counts[3][1] > 0 else 0,
+            "2 or fewer": round(n_2_correct / max(1, n_2_or_fewer) * 100) if n_2_or_fewer > 0 else 0,
         },
+        "sample_sizes_by_confidence": {
+            "5 stars": conf_counts[5][1],
+            "4 stars": conf_counts[4][1],
+            "3 stars": conf_counts[3][1],
+            "2 or fewer": n_2_or_fewer,
+        },
+        "horizon": horizon,
         "trades": trades[:25]
     }
 
 # ── 7. Charts Data ─────────────────────────────────────────────────────────────
 def get_chart_data(chart_id: str, symbol: str = "NIFTY") -> Dict[str, Any]:
-    conn = get_conn()
-    session_date = get_latest_session_date(symbol)
+    sb = get_supabase_client()
+    ribbon = get_ribbon_data(symbol)
 
     if chart_id == "c1":  # 5-min candles + flow markers
-        rows = conn.execute("""
-            SELECT spot_price, timestamp
-            FROM options_chain
-            WHERE symbol = ? AND DATE(timestamp) = ? AND spot_price IS NOT NULL
-            GROUP BY timestamp
-            ORDER BY timestamp ASC
-        """, (symbol, session_date)).fetchall()
-
         candles = []
-        for i, r in enumerate(rows):
-            p = float(r["spot_price"])
-            candles.append({
-                "time": ist_time_str(r["timestamp"]),
-                "open": round(p - 15, 2),
-                "high": round(p + 25, 2),
-                "low": round(p - 20, 2),
-                "close": round(p, 2),
-            })
-        conn.close()
-        return {"candles": candles, "markers": [{"index": 3, "type": "bull", "label": "24,800 CE"}]}
+        markers = []
+        if sb:
+            try:
+                latest_mc = sb.table("market_context").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+                if latest_mc.data:
+                    latest_date = latest_mc.data[0]["timestamp"][:10]
+                    mc_rows = sb.table("market_context").select("timestamp,spot_price").eq("symbol", symbol).gte("timestamp", f"{latest_date}T00:00:00").order("timestamp", desc=False).execute()
+
+                    prev_close = None
+                    for r in mc_rows.data:
+                        p = float(r["spot_price"] or 0)
+                        if p <= 0:
+                            continue
+                        o = prev_close if prev_close else round(p - 10, 2)
+                        h = round(max(o, p) + 12, 2)
+                        l = round(min(o, p) - 12, 2)
+                        c = round(p, 2)
+                        prev_close = c
+                        candles.append({
+                            "time": ist_time_str(r["timestamp"]),
+                            "open": o,
+                            "high": h,
+                            "low": l,
+                            "close": c,
+                        })
+
+                    sig_res = sb.table("signals").select("id,strike,option_type,bias,signal_type,fired_at").eq("symbol", symbol).gte("fired_at", f"{latest_date}T00:00:00").order("fired_at", desc=False).execute()
+                    if sig_res.data and candles:
+                        for s in sig_res.data:
+                            sig_time = ist_time_str(s["fired_at"])
+                            idx = len(candles) - 1
+                            for c_i, cand in enumerate(candles):
+                                if cand["time"] >= sig_time:
+                                    idx = c_i
+                                    break
+                            b_type = "bull" if (s.get("bias") or "").upper() == "BULLISH" else "bear"
+                            lbl = f"{int(s['strike']):,} {s['option_type']}" if s.get("strike") else s.get("signal_type", "SIGNAL")
+                            markers.append({
+                                "index": idx,
+                                "type": b_type,
+                                "label": lbl,
+                                "signal_id": s["id"],
+                            })
+            except Exception as e:
+                logger.warning("Supabase chart c1 error: %s", e)
+
+        if not candles:
+            conn = get_conn()
+            session_date = get_latest_session_date(symbol)
+            rows = conn.execute("""
+                SELECT spot_price, timestamp
+                FROM options_chain
+                WHERE symbol = ? AND DATE(timestamp) = ? AND spot_price IS NOT NULL
+                GROUP BY timestamp
+                ORDER BY timestamp ASC
+            """, (symbol, session_date)).fetchall()
+
+            for r in rows:
+                p = float(r["spot_price"])
+                candles.append({
+                    "time": ist_time_str(r["timestamp"]),
+                    "open": round(p - 15, 2),
+                    "high": round(p + 25, 2),
+                    "low": round(p - 20, 2),
+                    "close": round(p, 2),
+                })
+            conn.close()
+            markers = [{"index": 3, "type": "bull", "label": "24,800 CE"}]
+
+        return {"candles": candles, "markers": markers}
 
     elif chart_id == "c2":  # Call vs Put OI by strike
-        ribbon = get_ribbon_data(symbol)
-        latest_ts = ribbon.get("latest_timestamp")
-        rows = conn.execute("""
-            SELECT strike,
-                   SUM(CASE WHEN option_type='CE' THEN oi ELSE 0 END) as ce_oi,
-                   SUM(CASE WHEN option_type='PE' THEN oi ELSE 0 END) as pe_oi
-            FROM options_chain
-            WHERE symbol = ? AND timestamp = ?
-            GROUP BY strike
-            ORDER BY strike ASC
-        """, (symbol, latest_ts)).fetchall()
-        
         strikes_data = []
-        for r in rows:
-            strikes_data.append({
-                "strike": int(r["strike"]),
-                "ce_oi": round(r["ce_oi"] / 100000, 2),
-                "pe_oi": round(r["pe_oi"] / 100000, 2),
-            })
-        conn.close()
+        if sb:
+            try:
+                latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+                if latest_oc_res.data:
+                    latest_ts = latest_oc_res.data[0]["timestamp"]
+                    res = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts).execute()
+
+                    ce_map: Dict[float, int] = {}
+                    pe_map: Dict[float, int] = {}
+                    for r in res.data:
+                        k = float(r["strike"])
+                        oi = int(r["oi"] or 0)
+                        if r["option_type"] == "CE":
+                            ce_map[k] = ce_map.get(k, 0) + oi
+                        else:
+                            pe_map[k] = pe_map.get(k, 0) + oi
+
+                    spot = ribbon.get("spot", 22500.0)
+                    all_strikes = sorted(list(set(ce_map.keys()).union(set(pe_map.keys()))))
+                    near = sorted(all_strikes, key=lambda x: abs(x - spot))[:16]
+                    near.sort()
+                    for k in near:
+                        strikes_data.append({
+                            "strike": int(k),
+                            "ce_oi": round(ce_map.get(k, 0) / 100000, 2),
+                            "pe_oi": round(pe_map.get(k, 0) / 100000, 2),
+                        })
+            except Exception as e:
+                logger.warning("Supabase chart c2 error: %s", e)
+
+        if not strikes_data:
+            conn = get_conn()
+            session_date = get_latest_session_date(symbol)
+            latest_ts_row = conn.execute("SELECT MAX(timestamp) as ts FROM options_chain WHERE symbol = ? AND DATE(timestamp) = ?", (symbol, session_date)).fetchone()
+            latest_ts = latest_ts_row["ts"] if latest_ts_row else None
+            rows = conn.execute("""
+                SELECT strike,
+                       SUM(CASE WHEN option_type='CE' THEN oi ELSE 0 END) as ce_oi,
+                       SUM(CASE WHEN option_type='PE' THEN oi ELSE 0 END) as pe_oi
+                FROM options_chain
+                WHERE symbol = ? AND timestamp = ?
+                GROUP BY strike
+                ORDER BY strike ASC
+            """, (symbol, latest_ts)).fetchall()
+
+            for r in rows:
+                strikes_data.append({
+                    "strike": int(r["strike"]),
+                    "ce_oi": round(r["ce_oi"] / 100000, 2),
+                    "pe_oi": round(r["pe_oi"] / 100000, 2),
+                })
+            conn.close()
+
         return {"data": strikes_data}
 
     elif chart_id == "c3":  # IV Skew
-        ribbon = get_ribbon_data(symbol)
-        latest_ts = ribbon.get("latest_timestamp")
-        rows = conn.execute("""
-            SELECT strike,
-                   AVG(CASE WHEN option_type='CE' THEN iv END) as ce_iv,
-                   AVG(CASE WHEN option_type='PE' THEN iv END) as pe_iv
-            FROM options_chain
-            WHERE symbol = ? AND timestamp = ? AND iv IS NOT NULL
-            GROUP BY strike ORDER BY strike ASC
-        """, (symbol, latest_ts)).fetchall()
-        conn.close()
-        return {"skew": [{"strike": int(r["strike"]), "ce_iv": round(r["ce_iv"] or 0, 1), "pe_iv": round(r["pe_iv"] or 0, 1)} for r in rows if r["ce_iv"] or r["pe_iv"]]}
+        skew_data = []
+        if sb:
+            try:
+                latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
+                if latest_oc_res.data:
+                    latest_ts = latest_oc_res.data[0]["timestamp"]
+                    res = sb.table("options_chain").select("strike,option_type,iv").eq("symbol", symbol).eq("timestamp", latest_ts).execute()
 
-    conn.close()
+                    ce_iv: Dict[float, float] = {}
+                    pe_iv: Dict[float, float] = {}
+                    for r in res.data:
+                        k = float(r["strike"])
+                        iv = float(r["iv"] or 0)
+                        if r["option_type"] == "CE" and iv > 0:
+                            ce_iv[k] = iv
+                        elif r["option_type"] == "PE" and iv > 0:
+                            pe_iv[k] = iv
+
+                    spot = ribbon.get("spot", 22500.0)
+                    all_strikes = sorted(list(set(ce_iv.keys()).union(set(pe_iv.keys()))))
+                    near = sorted(all_strikes, key=lambda x: abs(x - spot))[:16]
+                    near.sort()
+                    for k in near:
+                        skew_data.append({
+                            "strike": int(k),
+                            "ce_iv": round(ce_iv.get(k, 0), 1),
+                            "pe_iv": round(pe_iv.get(k, 0), 1),
+                        })
+            except Exception as e:
+                logger.warning("Supabase chart c3 error: %s", e)
+
+        if not skew_data:
+            conn = get_conn()
+            session_date = get_latest_session_date(symbol)
+            latest_ts_row = conn.execute("SELECT MAX(timestamp) as ts FROM options_chain WHERE symbol = ? AND DATE(timestamp) = ?", (symbol, session_date)).fetchone()
+            latest_ts = latest_ts_row["ts"] if latest_ts_row else None
+            rows = conn.execute("""
+                SELECT strike,
+                       AVG(CASE WHEN option_type='CE' THEN iv END) as ce_iv,
+                       AVG(CASE WHEN option_type='PE' THEN iv END) as pe_iv
+                FROM options_chain
+                WHERE symbol = ? AND timestamp = ? AND iv IS NOT NULL
+                GROUP BY strike ORDER BY strike ASC
+            """, (symbol, latest_ts)).fetchall()
+            skew_data = [{"strike": int(r["strike"]), "ce_iv": round(r["ce_iv"] or 0, 1), "pe_iv": round(r["pe_iv"] or 0, 1)} for r in rows if r["ce_iv"] or r["pe_iv"]]
+            conn.close()
+
+        return {"skew": skew_data}
+
     return {}

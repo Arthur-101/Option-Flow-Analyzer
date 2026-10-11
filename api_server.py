@@ -82,10 +82,13 @@ def get_options_chain(symbol: str = Query("NIFTY")):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/backtest")
-def get_backtest(range: int = Query(7, description="Evaluation window in days (7, 14, 30, or 0 for All)")):
+def get_backtest(
+    range: int = Query(7, description="Evaluation window in days (7, 14, 30, or 0 for All)"),
+    horizon: str = Query("+7d", description="Forward evaluation horizon (+30m, +2h, EOD, +1d, +7d)")
+):
     """Returns backtesting analytics, daily win rates, setup breakdown, and verified trade history."""
     try:
-        return api_service.get_backtest_hub_data(range_days=range)
+        return api_service.get_backtest_hub_data(range_days=range, horizon=horizon)
     except Exception as e:
         logger.error("Failed to fetch backtest data: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
