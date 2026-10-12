@@ -99,19 +99,36 @@ def _get_ribbon_from_supabase(symbol: str = "NIFTY") -> Optional[Dict[str, Any]]
             latest_ist = latest_ts[11:16]
 
         today = date.today()
-        thursdays = []
-        for d in range(1, 40):
-            cand = today + timedelta(days=d)
-            if cand.weekday() == 3:
-                thursdays.append(cand)
-                if len(thursdays) == 3:
-                    break
-
         available_expiries = []
-        for th in thursdays:
-            dte = (th - today).days
-            label = f"{th.strftime('%d %b')} · {dte}d"
-            available_expiries.append({"expiry": th.isoformat(), "label": label, "dte": dte})
+        try:
+            exp_res = (
+                sb.table("options_chain")
+                .select("expiry")
+                .eq("symbol", symbol)
+                .gte("expiry", today.isoformat())
+                .order("expiry", desc=False)
+                .limit(200)
+                .execute()
+            )
+            raw_exps = sorted(list(set([r["expiry"] for r in exp_res.data if r.get("expiry")])))[:4]
+            for exp_s in raw_exps:
+                exp_d = datetime.strptime(exp_s, "%Y-%m-%d").date()
+                dte = (exp_d - today).days
+                label = f"{exp_d.strftime('%d %b')} · {dte}d"
+                available_expiries.append({"expiry": exp_s, "label": label, "dte": dte})
+        except Exception as e:
+            logger.warning("Error fetching dynamic expiries from Supabase: %s", e)
+
+        # Fallback to Tuesdays (current NSE weekly expiry) if no chain expiries found
+        if not available_expiries:
+            for d in range(0, 40):
+                cand = today + timedelta(days=d)
+                if cand.weekday() == 1:  # Tuesday
+                    dte = (cand - today).days
+                    label = f"{cand.strftime('%d %b')} · {dte}d"
+                    available_expiries.append({"expiry": cand.isoformat(), "label": label, "dte": dte})
+                    if len(available_expiries) == 3:
+                        break
 
         from holidays import is_market_holiday
         is_hol, _ = is_market_holiday()
@@ -205,14 +222,28 @@ def get_ribbon_data(symbol: str = "NIFTY", session_date: Optional[str] = None) -
     """, (symbol, session_date)).fetchone()
     latest_ts = latest_ts_row["ts"] if latest_ts_row and latest_ts_row["ts"] else None
 
-    # 3. PCR, Put Wall, Call Wall, Max Pain
+    # 3. PCR, Put Wall, Call Wall, Max Pain (filtered strictly to nearest weekly expiry)
     chain_rows = []
     if latest_ts:
-        chain_rows = conn.execute("""
-            SELECT strike, option_type, oi, volume, iv, last_price
-            FROM options_chain
-            WHERE symbol = ? AND timestamp = ?
-        """, (symbol, latest_ts)).fetchall()
+        exp_row = conn.execute("""
+            SELECT expiry FROM options_chain
+            WHERE symbol = ? AND timestamp = ? AND expiry IS NOT NULL AND expiry != ''
+            ORDER BY expiry ASC LIMIT 1
+        """, (symbol, latest_ts)).fetchone()
+        near_exp = exp_row["expiry"] if exp_row else None
+
+        if near_exp:
+            chain_rows = conn.execute("""
+                SELECT strike, option_type, oi, volume, iv, last_price
+                FROM options_chain
+                WHERE symbol = ? AND timestamp = ? AND expiry = ?
+            """, (symbol, latest_ts, near_exp)).fetchall()
+        else:
+            chain_rows = conn.execute("""
+                SELECT strike, option_type, oi, volume, iv, last_price
+                FROM options_chain
+                WHERE symbol = ? AND timestamp = ?
+            """, (symbol, latest_ts)).fetchall()
     
     total_ce_oi = 0
     total_pe_oi = 0
