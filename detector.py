@@ -426,6 +426,19 @@ def _percentile_strength(value: float, population: list[float]) -> float:
 
 def _build_signal(fired_at, symbol, row, signal_type,
                   strength, bias, mode) -> dict:
+    from datetime import date as dt_date, datetime as dt_datetime
+    exp_str = row.get("expiry")
+    dte = 0
+    if exp_str:
+        try:
+            exp_d = dt_date.fromisoformat(str(exp_str)[:10])
+            fired_d = dt_datetime.fromisoformat(str(fired_at).replace("Z", "+00:00")).date()
+            dte = max(0, (exp_d - fired_d).days)
+        except Exception:
+            dte = 0
+    is_expiry_day = (dte == 0)
+    entry_prem = float(row.get("last_price") or 0)
+
     return {
         "fired_at":       fired_at,
         "symbol":         symbol,
@@ -440,6 +453,12 @@ def _build_signal(fired_at, symbol, row, signal_type,
         "spot_price":     row.get("spot_price"),
         "bias":           bias,
         "mode":           mode,
+        "entry_premium":  round(entry_prem, 2) if entry_prem > 0 else None,
+        "dte":            dte,
+        "is_expiry_day":  is_expiry_day,
+        "target_pct":     0.30,
+        "stop_pct":       -0.20,
+        "is_exploratory": False,
         "llm_thesis":     None,
         "llm_bias":       None,
         "llm_confidence": None,
