@@ -1192,6 +1192,74 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
         total_evaluated = 0
         returns = []
 
+        # Temporal & Spatial Clustering (30-minute institutional campaign window)
+        clusters = []
+        trade_cluster_map = {}
+        eval_trades = [
+            t for t in sb_trades_raw
+            if not (t.get("exit_reason") and (str(t.get("exit_reason")).startswith("SKIPPED_") or t.get("exit_reason") == "NON_DIRECTIONAL"))
+            and t.get("resolved_at")
+        ]
+        eval_trades.sort(key=lambda x: x.get("entry_at") or "")
+
+        for t in eval_trades:
+            t_id = t["id"]
+            src = t.get("source", "RULES")
+            b = (t.get("bias_used") or "BULLISH").upper()
+            e_at = t.get("entry_at") or ""
+            pnl = float(t.get("net_pnl_pct") or 0.0)
+            try:
+                dt = datetime.fromisoformat(e_at.replace("Z", "+00:00"))
+            except Exception:
+                dt = datetime.now(timezone.utc)
+
+            assigned = False
+            for cl in reversed(clusters):
+                if cl["source"] == src and cl["bias"] == b:
+                    delta_m = (dt - cl["last_time"]).total_seconds() / 60.0
+                    if delta_m <= 30.0:
+                        cl["trade_ids"].append(t_id)
+                        cl["pnl_list"].append(pnl)
+                        cl["last_time"] = dt
+                        trade_cluster_map[t_id] = cl["label"]
+                        assigned = True
+                        break
+            if not assigned:
+                cl_idx = len(clusters) + 1
+                cl_label = f"C-{dt.strftime('%m%d')}-{cl_idx:02d}"
+                clusters.append({
+                    "id": cl_idx,
+                    "label": cl_label,
+                    "source": src,
+                    "bias": b,
+                    "date": e_at[:10],
+                    "start_time": dt,
+                    "last_time": dt,
+                    "trade_ids": [t_id],
+                    "pnl_list": [pnl],
+                })
+                trade_cluster_map[t_id] = cl_label
+
+        cluster_correct = 0
+        cluster_rules = [0, 0]
+        cluster_llm = [0, 0]
+        for cl in clusters:
+            avg_cl_pnl = float(np.mean(cl["pnl_list"])) if cl["pnl_list"] else 0.0
+            cl_win = (avg_cl_pnl > 0)
+            if cl_win:
+                cluster_correct += 1
+            if cl["source"] == "RULES":
+                cluster_rules[1] += 1
+                if cl_win:
+                    cluster_rules[0] += 1
+            elif cl["source"] == "LLM":
+                cluster_llm[1] += 1
+                if cl_win:
+                    cluster_llm[0] += 1
+
+        clusters_evaluated = len(clusters)
+        cluster_win_rate = round(cluster_correct / clusters_evaluated * 100, 1) if clusters_evaluated > 0 else 50.0
+
         for t in sb_trades_raw:
             exit_r = t.get("exit_reason")
             is_skipped = exit_r and (str(exit_r).startswith("SKIPPED_") or exit_r == "NON_DIRECTIONAL")
@@ -1201,6 +1269,7 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
             source = t.get("source", "RULES")
             entry_at = t.get("entry_at") or ""
             sig_date = entry_at[:10]
+            cl_id = trade_cluster_map.get(t.get("id"))
 
             if not is_skipped and t.get("resolved_at"):
                 total_evaluated += 1
@@ -1227,7 +1296,8 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
                 "id": t.get("id"),
                 "date": format_display_date(sig_date),
                 "strike_label": f"{int(t.get('strike') or 0):,} {t.get('option_type') or ''}",
-                "setup": f"{source} · {t.get('exit_reason') or 'Open'}",
+                "setup": f"{source} · {t.get('exit_reason') or 'Open'}" + (f" · {cl_id}" if cl_id else ""),
+                "cluster_id": cl_id or "Unclustered",
                 "predicted_bias": bias.capitalize(),
                 "confidence": 4 if source == "LLM" else 3,
                 "stars": "★★★★☆" if source == "LLM" else "★★★☆☆",
@@ -1244,7 +1314,7 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
                 "thesis": f"Trade execution for {source} bias {bias} on {t.get('expiry')}."
             })
 
-        win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 50.0
+        raw_win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 50.0
         avg_return = round(float(np.mean(returns)), 2) if returns else 0.0
 
         daily_win_rates = []
@@ -1257,18 +1327,24 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
             })
 
         return {
-            "win_rate": win_rate,
+            "win_rate": cluster_win_rate,
+            "raw_win_rate": raw_win_rate,
+            "clusters_evaluated": clusters_evaluated,
             "signals_evaluated": total_evaluated,
             "avg_forward_return": f"{avg_return:+.2f}%",
-            "best_setup": f"RULES · {round(setup_counts['RULES'][0]/max(1, setup_counts['RULES'][1])*100)}%",
+            "best_setup": f"RULES (Campaign) · {round(cluster_rules[0]/max(1, cluster_rules[1])*100)}%",
             "daily_win_rates": daily_win_rates,
             "accuracy_by_setup": {
-                "RULES": round(setup_counts["RULES"][0]/max(1, setup_counts["RULES"][1])*100) if setup_counts["RULES"][1] > 0 else 50,
-                "LLM": round(setup_counts["LLM"][0]/max(1, setup_counts["LLM"][1])*100) if setup_counts["LLM"][1] > 0 else 50,
+                "RULES": round(cluster_rules[0]/max(1, cluster_rules[1])*100) if cluster_rules[1] > 0 else 50,
+                "LLM": round(cluster_llm[0]/max(1, cluster_llm[1])*100) if cluster_llm[1] > 0 else 50,
             },
             "sample_sizes_by_setup": {
-                "RULES": setup_counts["RULES"][1],
-                "LLM": setup_counts["LLM"][1],
+                "RULES": cluster_rules[1],
+                "LLM": cluster_llm[1],
+            },
+            "raw_accuracy_by_setup": {
+                "RULES": round(setup_counts["RULES"][0]/max(1, setup_counts["RULES"][1])*100) if setup_counts["RULES"][1] > 0 else 50,
+                "LLM": round(setup_counts["LLM"][0]/max(1, setup_counts["LLM"][1])*100) if setup_counts["LLM"][1] > 0 else 50,
             },
             "accuracy_by_confidence": {"5 stars": 68, "4 stars": 54, "3 stars": 44, "2 or fewer": 100},
             "sample_sizes_by_confidence": {"5 stars": 412, "4 stars": 560, "3 stars": 558, "2 or fewer": 1},
