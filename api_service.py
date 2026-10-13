@@ -1199,17 +1199,21 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
             if bias == "BEARISH":
                 move_pct = -move_pct
 
-        total_evaluated += 1
-        if is_correct:
-            total_correct += 1
-        returns.append(move_pct)
+        exit_r = r["exit_reason"] if ("exit_reason" in r.keys() and r["exit_reason"]) else None
+        is_skipped = exit_r and (str(exit_r).startswith("SKIPPED_") or exit_r == "NON_DIRECTIONAL")
 
-        # Track per setup
-        stype = r["signal_type"]
-        if stype in setup_counts:
-            setup_counts[stype][1] += 1
+        if not is_skipped:
+            total_evaluated += 1
             if is_correct:
-                setup_counts[stype][0] += 1
+                total_correct += 1
+            returns.append(move_pct)
+
+            # Track per setup
+            stype = r["signal_type"]
+            if stype in setup_counts:
+                setup_counts[stype][1] += 1
+                if is_correct:
+                    setup_counts[stype][0] += 1
 
         # Track per confidence
         c_tier = max(1, min(5, conf))
@@ -1266,8 +1270,8 @@ def get_backtest_hub_data(range_days: int = 7, horizon: str = "+7d") -> Dict[str
             "spot_forward": f"{spot_forward:,}",
             "spot_plus_7": f"{spot_forward:,}",
             "move_pct": f"{move_pct:+.1f}%",
-            "outcome": "Correct" if is_correct else "Missed",
-            "is_correct": is_correct,
+            "outcome": exit_r if is_skipped else ("Correct" if is_correct else "Missed"),
+            "is_correct": False if is_skipped else is_correct,
             "edge": f"{edge_pct:+.1f}%",
             "edge_val": edge_pct,
             "horizon": horizon,
