@@ -59,6 +59,28 @@ def get_supabase_client() -> Optional[Client]:
     return _sb_client
 
 
+def _get_active_expiry_supabase(sb: Client, symbol: str, timestamp: str) -> Optional[str]:
+    """Find the nearest active weekly expiry for a given snapshot timestamp."""
+    try:
+        res = (
+            sb.table("options_chain")
+            .select("expiry")
+            .eq("symbol", symbol)
+            .eq("timestamp", timestamp)
+            .limit(50)
+            .execute()
+        )
+        if not res.data:
+            return None
+        expiries = sorted(list({r["expiry"] for r in res.data if r.get("expiry")}))
+        snap_date = timestamp[:10]
+        active = [e for e in expiries if e >= snap_date]
+        return active[0] if active else (expiries[0] if expiries else None)
+    except Exception:
+        return None
+
+
+
 def _get_ribbon_from_supabase(symbol: str = "NIFTY") -> Optional[Dict[str, Any]]:
     sb = get_supabase_client()
     if not sb:
@@ -630,7 +652,11 @@ def get_latest_thesis(symbol: str = "NIFTY") -> Dict[str, Any]:
             latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
             if latest_oc_res.data:
                 latest_ts_cloud = latest_oc_res.data[0]["timestamp"]
-                chain_res = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts_cloud).execute()
+                active_exp = _get_active_expiry_supabase(sb, symbol, latest_ts_cloud)
+                q = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts_cloud)
+                if active_exp:
+                    q = q.eq("expiry", active_exp)
+                chain_res = q.execute()
                 for r in chain_res.data:
                     k = float(r["strike"])
                     oi = int(r["oi"] or 0)
@@ -1003,7 +1029,11 @@ def get_options_chain_ladder(symbol: str = "NIFTY") -> Dict[str, Any]:
             latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
             if latest_oc_res.data:
                 latest_oc_ts = latest_oc_res.data[0]["timestamp"]
-                res = sb.table("options_chain").select("strike,option_type,oi,oi_change,volume,iv,last_price").eq("symbol", symbol).eq("timestamp", latest_oc_ts).order("strike", desc=False).execute()
+                active_exp = _get_active_expiry_supabase(sb, symbol, latest_oc_ts)
+                q = sb.table("options_chain").select("strike,option_type,oi,oi_change,volume,iv,last_price").eq("symbol", symbol).eq("timestamp", latest_oc_ts)
+                if active_exp:
+                    q = q.eq("expiry", active_exp)
+                res = q.order("strike", desc=False).execute()
                 if res.data:
                     rows = res.data
         except Exception as e:
@@ -1688,7 +1718,11 @@ def get_chart_data(chart_id: str, symbol: str = "NIFTY") -> Dict[str, Any]:
                 latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
                 if latest_oc_res.data:
                     latest_ts = latest_oc_res.data[0]["timestamp"]
-                    res = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts).execute()
+                    active_exp = _get_active_expiry_supabase(sb, symbol, latest_ts)
+                    q = sb.table("options_chain").select("strike,option_type,oi").eq("symbol", symbol).eq("timestamp", latest_ts)
+                    if active_exp:
+                        q = q.eq("expiry", active_exp)
+                    res = q.execute()
 
                     ce_map: Dict[float, int] = {}
                     pe_map: Dict[float, int] = {}
@@ -1745,7 +1779,11 @@ def get_chart_data(chart_id: str, symbol: str = "NIFTY") -> Dict[str, Any]:
                 latest_oc_res = sb.table("options_chain").select("timestamp").eq("symbol", symbol).order("timestamp", desc=True).limit(1).execute()
                 if latest_oc_res.data:
                     latest_ts = latest_oc_res.data[0]["timestamp"]
-                    res = sb.table("options_chain").select("strike,option_type,iv").eq("symbol", symbol).eq("timestamp", latest_ts).execute()
+                    active_exp = _get_active_expiry_supabase(sb, symbol, latest_ts)
+                    q = sb.table("options_chain").select("strike,option_type,iv").eq("symbol", symbol).eq("timestamp", latest_ts)
+                    if active_exp:
+                        q = q.eq("expiry", active_exp)
+                    res = q.execute()
 
                     ce_iv: Dict[float, float] = {}
                     pe_iv: Dict[float, float] = {}
