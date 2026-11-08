@@ -16,7 +16,8 @@
 - [ ] **Replace remaining mock chart data.** Backend returns `c1`–`c6`, but only `c2` is real in the UI (see frontend docs). Backend-side, confirm each chart ID returns honest, documented data.
 - [ ] **News summaries.** 0 summaries in local DB. Wire `news_fetcher.py` output through to `get_ribbon_data`/thesis context.
 - [ ] **Thesis coverage and conviction.** Only 89/847 signals have a thesis; 74/89 are NEUTRAL. Pause LLM trade execution until the quant baseline is clean, but keep generating theses for offline evaluation.
-- [ ] **Signal-logic redesign.** Kill or redesign `IV_SPIKE` (11.4% win), add a regime filter (BEARISH 31.3% vs BULLISH 56.0%), replace always-top-10% percentile thresholds, cap signals per flush, and shorten the 5-minute entry lag.
+- [x] **Retire `VOLUME_SPIKE` and cap signals per flush.** Done 2026-11-08 in `ofa_collector` (commit `3d919ff`): the detector was hardcoded `NEUTRAL`, so all 181 of its signals were excluded as non-directional; a flush could emit 26 signals, now capped at 8 by strength. Needs a Render deploy.
+- [ ] **Signal-logic redesign, rest.** `IV_SPIKE` is not measurable yet (3 clean trades of 82 — the rest fell in the frozen-feed window), so it stays. **No regime filter:** BEARISH 38.3% vs BULLISH 62.1% comes from two sessions of one market direction, which is curve fitting, not an edge. Revisit with clean trades in both directions. Still open: always-top-10% percentile thresholds and the 5-minute entry lag.
 
 ## P2 — hardening
 
