@@ -9,6 +9,31 @@ logger = logging.getLogger("backfill")
 TARGET_PCT = 0.30   # +30% profit target
 STOP_PCT   = -0.20  # -20% stop loss
 COST_PCT   = 0.005  # 0.5% estimated slippage and transaction costs
+MIN_ENTRY_PREMIUM = 10.0    # same floor as the live resolver
+MAX_ENTRY_DELAY_MIN = 15    # entry must be the next 5-min snapshot
+MAX_RETURN_MULTIPLE = 10.0  # reject 10x+ entry→exit jumps as bad data
+
+def _mark_skipped(sb, sig_id, reason, dte, is_expiry_day, resolved_at):
+    """Zero-PnL skip so a bad historical tick never becomes a fake win/loss."""
+    try:
+        sb.table("signals").update({
+            "entry_premium": 0.0,
+            "exit_premium": 0.0,
+            "exit_reason": reason,
+            "net_pnl_pct": 0.0,
+            "mfe": 0.0,
+            "mae": 0.0,
+            "resolved_at": resolved_at,
+            "dte": dte,
+            "is_expiry_day": is_expiry_day,
+            "target_pct": TARGET_PCT,
+            "stop_pct": STOP_PCT,
+            "is_exploratory": True,
+            "outcome_correct": None,
+        }).eq("id", sig_id).execute()
+    except Exception as e:
+        logger.error("Skip update failed for signal %s: %s", sig_id, e)
+
 
 def run_backfill():
     sb = get_supabase_client()
@@ -58,45 +83,44 @@ def run_backfill():
         )
         if expiry_str:
             q = q.eq("expiry", expiry_str[:10])
+        # Same-session ticks only; a next-day tick is not a valid exit.
+        q = q.lt("timestamp", fired_at_str[:10] + "T23:59:59")
 
         ticks_res = q.limit(100).execute()
         ticks = ticks_res.data or []
 
-        if not ticks and expiry_str:
-            fallback_q = (
-                sb.table("options_chain")
-                .select("timestamp,last_price")
-                .eq("symbol", "NIFTY")
-                .eq("strike", strike)
-                .eq("option_type", opt_type)
-                .gte("timestamp", fired_at_str)
-                .order("timestamp", desc=False)
-                .limit(100)
-            )
-            ticks = fallback_q.execute().data or []
-
         if not ticks:
-            logger.info("Signal %s (%s %s %s): No chain ticks found in window", sig_id, strike, opt_type, fired_at_str)
-            # Still tag as exploratory
-            try:
-                sb.table("signals").update({
-                    "dte": dte,
-                    "is_expiry_day": is_expiry_day,
-                    "is_exploratory": True,
-                    "target_pct": TARGET_PCT,
-                    "stop_pct": STOP_PCT,
-                }).eq("id", sig_id).execute()
-            except Exception as e:
-                logger.error("Update failed for signal %s: %s", sig_id, e)
+            logger.info("Signal %s (%s %s %s): No chain ticks found", sig_id, strike, opt_type, fired_at_str)
+            _mark_skipped(sb, sig_id, "SKIPPED_NO_DATA", dte, is_expiry_day, fired_at_str)
             continue
 
-        # 1. Entry price = LTP at the next available snapshot
+        # 1. Entry = first tick, but only if it is the next 5-min snapshot
+        #    in the same session. Otherwise the "entry" is hours late.
+        try:
+            first_ts = datetime.fromisoformat(ticks[0]["timestamp"].replace("Z", "+00:00"))
+            delay_min = (first_ts - fired_dt).total_seconds() / 60.0
+        except Exception:
+            first_ts = None
+            delay_min = None
+
+        if first_ts is None or first_ts.date() != fired_dt.date() or (
+            delay_min is not None and delay_min > MAX_ENTRY_DELAY_MIN
+        ):
+            logger.info("Signal %s: entry tick is %.0f min late or off-session", sig_id, delay_min or -1)
+            _mark_skipped(sb, sig_id, "SKIPPED_STALE_SIGNAL", dte, is_expiry_day, ticks[0]["timestamp"])
+            continue
+
         entry_price = float(ticks[0]["last_price"] or 0)
         if entry_price <= 0 and len(ticks) > 1:
             entry_price = float(ticks[1]["last_price"] or 0)
 
         if entry_price <= 0:
-            logger.warning("Signal %s: invalid entry price <= 0", sig_id)
+            _mark_skipped(sb, sig_id, "SKIPPED_NO_DATA", dte, is_expiry_day, ticks[0]["timestamp"])
+            continue
+
+        if entry_price < MIN_ENTRY_PREMIUM:
+            logger.info("Signal %s: entry ₹%.2f below ₹%.0f floor", sig_id, entry_price, MIN_ENTRY_PREMIUM)
+            _mark_skipped(sb, sig_id, "SKIPPED_LOW_PREMIUM", dte, is_expiry_day, ticks[0]["timestamp"])
             continue
 
         # 2. Simulate fixed-rule execution across subsequent ticks
@@ -136,7 +160,13 @@ def run_backfill():
             exit_price = p
             resolved_at = t["timestamp"]
 
-        # 3. Calculate realized net PnL (after costs)
+        # 3. Reject impossible entry→exit jumps (lottery-ticket contamination)
+        if exit_price > entry_price * MAX_RETURN_MULTIPLE or exit_price < entry_price / MAX_RETURN_MULTIPLE:
+            logger.info("Signal %s: exit ₹%.2f vs entry ₹%.2f fails sanity guard", sig_id, exit_price, entry_price)
+            _mark_skipped(sb, sig_id, "SKIPPED_SANITY", dte, is_expiry_day, resolved_at)
+            continue
+
+        # 4. Calculate realized net PnL (after costs)
         gross_pnl_pct = (exit_price - entry_price) / entry_price
         net_pnl_pct = round((gross_pnl_pct - COST_PCT) * 100, 2)
 
