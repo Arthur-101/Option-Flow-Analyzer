@@ -1210,6 +1210,59 @@ def _to_ist_time(iso_ts: Optional[str]) -> str:
         return ""
 
 # ── 6. Backtesting Hub ────────────────────────────────────────────────────────
+def _underlying_hit_rate(trades: List[dict], sb) -> tuple:
+    """Score trades on NIFTY spot direction, which survives a frozen option quote.
+
+    A stale_ltp trade cannot be priced, but the index kept printing, so the
+    signal's direction is still checkable: did spot at the 15:20 IST exit close
+    beyond spot at entry? Returns (wins, scored) using stored data only.
+    """
+    if not trades or not sb:
+        return 0, 0
+
+    days = sorted({str(t.get("entry_at"))[:10] for t in trades if t.get("entry_at")})
+    series: Dict[str, List[tuple]] = {}
+    for d in days:
+        try:
+            rows = (
+                sb.table("market_context").select("timestamp,spot_price")
+                .gte("timestamp", f"{d}T00:00:00+00:00")
+                .lt("timestamp", f"{d}T23:59:59+00:00")
+                .order("timestamp").limit(200).execute().data or []
+            )
+        except Exception as e:
+            logger.debug("spot lookup failed for %s: %s", d, e)
+            continue
+        series[d] = [
+            (datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")), r["spot_price"])
+            for r in rows if r.get("spot_price")
+        ]
+
+    wins = scored = 0
+    for t in trades:
+        d = str(t.get("entry_at"))[:10]
+        pts = series.get(d) or []
+        bias = str(t.get("bias_used") or "").upper()
+        if not pts or not bias:
+            continue
+        try:
+            t0 = datetime.fromisoformat(str(t["entry_at"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        t1 = datetime.fromisoformat(f"{d}T09:50:00+00:00")  # 15:20 IST exit
+        s0 = s1 = None
+        for ts, px in pts:
+            if ts <= t0:
+                s0 = px
+            if ts <= t1:
+                s1 = px
+        if s0 is None or s1 is None:
+            continue
+        scored += 1
+        wins += (s1 > s0) if "BULL" in bias else (s1 < s0)
+    return wins, scored
+
+
 def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[str, Any]:
     # NOTE: horizon is accepted for API compatibility but does not rescale
     # returns. Trades resolve same-day at target / stop / 15:20 IST.
@@ -1423,6 +1476,25 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
             "fill_rate": round(filled / actionable * 100, 1) if actionable else 0.0,
         }
 
+        # Manski bounds on the trades actually opened. A late entry is never
+        # opened, so it cannot be a win or a loss; only the unpriceable ones are
+        # censored. Scoring them on spot tells us whether the censoring hid bad
+        # signals or merely a dead feed.
+        opened = filled + excluded_by_reason["stale_ltp"]
+        censored = [t for t in sb_trades_raw if t.get("stale_ltp")]
+        filled_rows = [t for t in sb_trades_raw if t.get("id") in dedup_trade_ids]
+        cen_wins, cen_n = _underlying_hit_rate(censored, sb)
+        fil_wins, fil_n = _underlying_hit_rate(filled_rows, sb)
+        execution_bounds = {
+            "opened": opened,
+            "low_pct": round(total_correct / opened * 100, 1) if opened else 0.0,
+            "high_pct": round((total_correct + excluded_by_reason["stale_ltp"]) / opened * 100, 1) if opened else 0.0,
+            "censored_n": cen_n,
+            "censored_hit_pct": round(cen_wins / cen_n * 100, 1) if cen_n else None,
+            "filled_n": fil_n,
+            "filled_hit_pct": round(fil_wins / fil_n * 100, 1) if fil_n else None,
+        }
+
         raw_win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 0.0
         avg_return = round(float(np.mean(returns)), 2) if returns else 0.0
 
@@ -1563,6 +1635,7 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
             "sample_warning": sample_warning,
             "excluded_by_reason": excluded_by_reason,
             "execution_funnel": execution_funnel,
+            "execution_bounds": execution_bounds,
             "excluded_trades": len(sb_trades_raw) - total_evaluated,
             "horizon": horizon,
             "trades": trades
@@ -1617,6 +1690,11 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
         "execution_funnel": {
             "actionable": 0, "filled": 0, "missed_late": 0,
             "unpriceable": 0, "fill_rate": 0.0,
+        },
+        "execution_bounds": {
+            "opened": 0, "low_pct": 0.0, "high_pct": 0.0,
+            "censored_n": 0, "censored_hit_pct": None,
+            "filled_n": 0, "filled_hit_pct": None,
         },
         "excluded_trades": 0,
         "horizon": horizon,
