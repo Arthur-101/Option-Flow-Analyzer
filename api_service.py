@@ -1263,6 +1263,17 @@ def _underlying_hit_rate(trades: List[dict], sb) -> tuple:
     return wins, scored
 
 
+def _two_prop_p(w1: int, n1: int, w2: int, n2: int) -> Optional[float]:
+    """Two-sided p-value for a difference in two proportions (normal approx)."""
+    if not n1 or not n2:
+        return None
+    pooled = (w1 + w2) / (n1 + n2)
+    se = math.sqrt(pooled * (1 - pooled) * (1 / n1 + 1 / n2))
+    if se == 0:
+        return None
+    return round(math.erfc(abs(w1 / n1 - w2 / n2) / se / math.sqrt(2)), 2)
+
+
 def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[str, Any]:
     # NOTE: horizon is accepted for API compatibility but does not rescale
     # returns. Trades resolve same-day at target / stop / 15:20 IST.
@@ -1493,6 +1504,11 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
             "censored_hit_pct": round(cen_wins / cen_n * 100, 1) if cen_n else None,
             "filled_n": fil_n,
             "filled_hit_pct": round(fil_wins / fil_n * 100, 1) if fil_n else None,
+            # Path-independent: spot at exit ignores the intraday whipsaw that
+            # can stop an option out, and moneyness/IV change the mapping from
+            # spot move to option P&L. So this cannot narrow the bounds; the
+            # p-value stops a reader treating a noisy gap as a real one.
+            "spot_p_value": _two_prop_p(cen_wins, cen_n, fil_wins, fil_n),
         }
 
         raw_win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 0.0
@@ -1694,7 +1710,7 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
         "execution_bounds": {
             "opened": 0, "low_pct": 0.0, "high_pct": 0.0,
             "censored_n": 0, "censored_hit_pct": None,
-            "filled_n": 0, "filled_hit_pct": None,
+            "filled_n": 0, "filled_hit_pct": None, "spot_p_value": None,
         },
         "excluded_trades": 0,
         "horizon": horizon,
