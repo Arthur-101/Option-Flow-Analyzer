@@ -93,6 +93,11 @@ Gemini's review of the measurement logic found these still-open limits. They are
 - **Cause:** the display mapping tested `"SPIKE" in st_type` before checking for `IV`, so an IV spike matched the volume branch.
 - **Fix (in code):** `IV_SPIKE` → `IV spike`; `VOLUME_SPIKE` keeps `Volume breakout`. The client-side fallback in `TopSignalsStrip.tsx` got the same ordering.
 
+### 18. Win rate had no denominator (P1, fixed)
+- **Symptom:** The hub showed `52.9% · n=155` with no indication that 642 rows had been dropped, so it read as the win rate of the strategy rather than of the trades that happened to be measurable.
+- **Cause:** Exclusions were lumped into one `skipped` bucket, which mixed ex-ante scope filters (exploratory, non-directional, premium floor) with ex-post execution failures (late entry, unpriceable quote). Only the former are safe to drop from the denominator.
+- **Fix (in code):** `excluded_by_reason` now splits `late_entry` and `low_premium`, and the response carries an `execution_funnel`: 259 actionable → 155 filled (59.8%) · 34 missed (late entry) · 70 unpriceable (stale quote). The KPI is relabelled **Conditional win rate** with a tooltip saying it covers filled trades only, and the funnel is printed above the exclusion list. Reviewed with Gemini (Argon Medium) 2026-11-10.
+
 ## Resolved
 
 ### `fetchSignalDetail` unused

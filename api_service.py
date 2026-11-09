@@ -1382,9 +1382,13 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
 
         # Why rows were dropped matters: "no trades since 15 Oct" is really
         # "185 rows resolved but none was measurable". Count them by reason.
+        # Execution failures (late entry, unpriceable quote) are kept separate
+        # from ex-ante scope filters (exploratory, non-directional, premium
+        # floor): a trader attempting every signal would still hit the former,
+        # so they belong in the denominator the win rate is measured against.
         excluded_by_reason = {
-            "stale_ltp": 0, "exploratory": 0, "skipped": 0,
-            "non_directional": 0, "unresolved": 0, "duplicate_signal": 0,
+            "stale_ltp": 0, "exploratory": 0, "late_entry": 0, "low_premium": 0,
+            "non_directional": 0, "unresolved": 0, "duplicate_signal": 0, "skipped": 0,
         }
         for t in sb_trades_raw:
             exit_r = str(t.get("exit_reason") or "")
@@ -1392,6 +1396,10 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
                 excluded_by_reason["stale_ltp"] += 1
             elif t.get("is_exploratory"):
                 excluded_by_reason["exploratory"] += 1
+            elif exit_r in ("SKIPPED_LATE_ENTRY", "SKIPPED_STALE_SIGNAL"):
+                excluded_by_reason["late_entry"] += 1
+            elif exit_r == "SKIPPED_LOW_PREMIUM":
+                excluded_by_reason["low_premium"] += 1
             elif exit_r.startswith("SKIPPED_"):
                 excluded_by_reason["skipped"] += 1
             elif exit_r == "NON_DIRECTIONAL":
@@ -1400,6 +1408,20 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
                 excluded_by_reason["unresolved"] += 1
             elif t.get("id") not in dedup_trade_ids:
                 excluded_by_reason["duplicate_signal"] += 1
+
+        # Execution funnel: the win rate is conditional on a fill, so show what
+        # happened to the signals a trader would actually have had to act on.
+        filled = len(dedup_trade_ids)
+        missed_late = excluded_by_reason["late_entry"]
+        unpriceable = excluded_by_reason["stale_ltp"] + excluded_by_reason["skipped"]
+        actionable = filled + missed_late + unpriceable
+        execution_funnel = {
+            "actionable": actionable,
+            "filled": filled,
+            "missed_late": missed_late,
+            "unpriceable": unpriceable,
+            "fill_rate": round(filled / actionable * 100, 1) if actionable else 0.0,
+        }
 
         raw_win_rate = round((total_correct / total_evaluated * 100), 1) if total_evaluated > 0 else 0.0
         avg_return = round(float(np.mean(returns)), 2) if returns else 0.0
@@ -1540,6 +1562,7 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
             "data_status": "ok" if total_evaluated >= 30 else "insufficient_sample",
             "sample_warning": sample_warning,
             "excluded_by_reason": excluded_by_reason,
+            "execution_funnel": execution_funnel,
             "excluded_trades": len(sb_trades_raw) - total_evaluated,
             "horizon": horizon,
             "trades": trades
@@ -1591,6 +1614,10 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
         "data_status": "no_execution_data",
         "sample_warning": "No resolved execution trades in Supabase. Nothing to measure yet.",
         "excluded_by_reason": {},
+        "execution_funnel": {
+            "actionable": 0, "filled": 0, "missed_late": 0,
+            "unpriceable": 0, "fill_rate": 0.0,
+        },
         "excluded_trades": 0,
         "horizon": horizon,
         "trades": [],
