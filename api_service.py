@@ -1223,16 +1223,22 @@ def _underlying_hit_rate(trades: List[dict], sb) -> tuple:
     days = sorted({str(t.get("entry_at"))[:10] for t in trades if t.get("entry_at")})
     series: Dict[str, List[tuple]] = {}
     for d in days:
-        try:
-            rows = (
-                sb.table("market_context").select("timestamp,spot_price")
-                .gte("timestamp", f"{d}T00:00:00+00:00")
-                .lt("timestamp", f"{d}T23:59:59+00:00")
-                .order("timestamp").limit(200).execute().data or []
-            )
-        except Exception as e:
-            logger.debug("spot lookup failed for %s: %s", d, e)
-            continue
+        rows = None
+        for attempt in (1, 2):
+            try:
+                rows = (
+                    sb.table("market_context").select("timestamp,spot_price")
+                    .gte("timestamp", f"{d}T00:00:00+00:00")
+                    .lt("timestamp", f"{d}T23:59:59+00:00")
+                    .order("timestamp").limit(200).execute().data or []
+                )
+                break
+            except Exception as e:
+                logger.debug("spot lookup failed for %s (attempt %d): %s", d, attempt, e)
+        if rows is None:
+            # Dropping the day would silently shrink the denominator and make
+            # the hit rate look measured when it is not. Report nothing.
+            return 0, 0
         series[d] = [
             (datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")), r["spot_price"])
             for r in rows if r.get("spot_price")
@@ -1448,24 +1454,33 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
         # "185 rows resolved but none was measurable". Count them by reason.
         # Execution failures (late entry, unpriceable quote) are kept separate
         # from ex-ante scope filters (exploratory, non-directional, premium
-        # floor): a trader attempting every signal would still hit the former,
-        # so they belong in the denominator the win rate is measured against.
+        # floor, moneyness): a trader attempting every signal would still hit
+        # the former, so they belong in the denominator the win rate is
+        # measured against. SKIPPED_MONEYNESS is checked before stale/late in
+        # the resolver and rejects a strike >1.5% from spot, so it is a scope
+        # filter, not a pricing failure.
         excluded_by_reason = {
             "stale_ltp": 0, "exploratory": 0, "late_entry": 0, "low_premium": 0,
-            "non_directional": 0, "unresolved": 0, "duplicate_signal": 0, "skipped": 0,
+            "moneyness": 0, "non_directional": 0, "unresolved": 0,
+            "duplicate_signal": 0, "skipped": 0,
         }
+        censored_rows = []  # opened, but no usable exit quote
         for t in sb_trades_raw:
             exit_r = str(t.get("exit_reason") or "")
             if t.get("stale_ltp"):
                 excluded_by_reason["stale_ltp"] += 1
+                censored_rows.append(t)
             elif t.get("is_exploratory"):
                 excluded_by_reason["exploratory"] += 1
             elif exit_r in ("SKIPPED_LATE_ENTRY", "SKIPPED_STALE_SIGNAL"):
                 excluded_by_reason["late_entry"] += 1
             elif exit_r == "SKIPPED_LOW_PREMIUM":
                 excluded_by_reason["low_premium"] += 1
+            elif exit_r == "SKIPPED_MONEYNESS":
+                excluded_by_reason["moneyness"] += 1
             elif exit_r.startswith("SKIPPED_"):
                 excluded_by_reason["skipped"] += 1
+                censored_rows.append(t)
             elif exit_r == "NON_DIRECTIONAL":
                 excluded_by_reason["non_directional"] += 1
             elif not t.get("resolved_at"):
@@ -1491,15 +1506,14 @@ def get_backtest_hub_data(range_days: int = 30, horizon: str = "+7d") -> Dict[st
         # opened, so it cannot be a win or a loss; only the unpriceable ones are
         # censored. Scoring them on spot tells us whether the censoring hid bad
         # signals or merely a dead feed.
-        opened = filled + excluded_by_reason["stale_ltp"]
-        censored = [t for t in sb_trades_raw if t.get("stale_ltp")]
+        opened = filled + len(censored_rows)
         filled_rows = [t for t in sb_trades_raw if t.get("id") in dedup_trade_ids]
-        cen_wins, cen_n = _underlying_hit_rate(censored, sb)
+        cen_wins, cen_n = _underlying_hit_rate(censored_rows, sb)
         fil_wins, fil_n = _underlying_hit_rate(filled_rows, sb)
         execution_bounds = {
             "opened": opened,
             "low_pct": round(total_correct / opened * 100, 1) if opened else 0.0,
-            "high_pct": round((total_correct + excluded_by_reason["stale_ltp"]) / opened * 100, 1) if opened else 0.0,
+            "high_pct": round((total_correct + len(censored_rows)) / opened * 100, 1) if opened else 0.0,
             "censored_n": cen_n,
             "censored_hit_pct": round(cen_wins / cen_n * 100, 1) if cen_n else None,
             "filled_n": fil_n,
