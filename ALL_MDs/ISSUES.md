@@ -83,7 +83,7 @@
 Gemini's review of the measurement logic found these still-open limits. They are documented rather than hidden; none is fixed by UI wording alone.
 1. **Wilson CI overstates precision.** Signals overlap and are autocorrelated, and RULES outcomes are preferred over LLM for the same signal, so effective n is nearer 10–15 than 155. `ci_str` now says `(assumes independent trades)`.
 2. **Profit factor assumes equal notional.** Deep-ITM premiums dominate the percentage return; `profit_factor_sub` now says `(% per trade, equal notional)`.
-3. **Two-session sample.** All clean trades are 14–15 Oct (see #5). 52.9% / +7.36% describe that sample only, not a 30-day edge.
+3. **Four-session sample.** Clean trades are 14 Oct, 15 Oct, 11 Nov and 12 Nov (see #5). Every figure describes that sample only, not a 30-day edge. The 30-day window also slides: on 12 Nov it dropped 12 Oct's 211 exploratory trades and added 12 Nov's 125, so row totals change without any code change.
 4. **Conviction % read as a win probability** — fixed in UI: relabelled **Model score** (hero gauge, cards, drawer, table header) with a "not a probability of profit" tooltip. The formula is unchanged, so the caveat still belongs here.
 5. **NEUTRAL target equalled spot**, so the ladder showed `+0.0 pts`. Fixed in UI: when target is within 0.5 pts of spot the ladder shows `—` and "no level beyond spot" instead of a 0.00% target. The backend still returns the measured level.
 6. **Split-brain pipeline.** `market_context` (2026-11-06) and the chain expiries (27 Oct / 03 Nov) come from different writes. The expired label and the `chain series expired` suffix flag it; the real fix is one collector writing both.
@@ -103,6 +103,25 @@ Gemini's review of the measurement logic found these still-open limits. They are
 - **2026-11-11 regression — `SKIPPED_MONEYNESS` was in the wrong bucket (fixed).** The first live session produced 28 `SKIPPED_MONEYNESS` rows, and they fell into the catch-all `skipped` bucket, which feeds `unpriceable`. But `resolver.py` checks moneyness **before** stale/late/premium and rejects any strike more than `MAX_MONEYNESS_PCT = 0.015` (1.5%) from spot — an **ex-ante** strike filter, the same class as the premium floor. So the funnel was understating the fill rate: `199/334 = 59.6%` instead of `199/306 = 65.0%`. Now a separate `moneyness` bucket, excluded from `actionable` and from the bounds' `opened`. `censored_rows` is collected in the same loop as the counts, so `opened == filled + unpriceable` holds by construction instead of by two parallel filters that could drift.
 - **The spot proxy was flaky (fixed).** A transient Supabase error on one day's `market_context` fetch was swallowed with `continue`, silently dropping those trades from the denominator: `censored_n` came back 65 in one call and 70 in another. Now each day retries once, and if it still fails the function returns `(0, 0)` so `censored_hit_pct` is `None` and the UI shows nothing — no number built on a partial sample.
 - **Live numbers after the first real session (30-day window, 14 Oct → 11 Nov, 3 sessions):** win rate **53.3%**, n=199, 95% CI 46–60; funnel **306 actionable → 199 filled (65.0%) · 37 missed · 70 unpriceable**; bounds **[39.4%, 65.4%]** on 269 opened; spot direction 60.0% vs 55.3%, p=0.49; exclusions `{stale_ltp:70, exploratory:221, late_entry:37, low_premium:51, moneyness:28, non_directional:294}` = 701, and 701 + 199 filled = 900 rows, every one accounted for.
+- **2026-11-12 update (30-day window, 14 Oct → 12 Nov, 4 sessions):** win rate **48.3%**, n=263, 95% CI **42–54**; funnel **375 actionable → 263 filled (70.1%) · 42 missed · 70 unpriceable**; bounds **[38.1%, 59.2%]** on 333 opened; spot direction 53.2% vs 60.0%, p=0.31; expectancy +4.83%/trade; profit factor 1.45; max drawdown −5.05 units; exclusions `{non_directional:322, stale_ltp:70, moneyness:55, low_premium:51, late_entry:42, exploratory:10, duplicate_signal:1}` = 551, and 551 + 263 = 814 rows. The 211-row drop versus the previous reading is 12 Oct leaving the window, not data loss.
+
+### 19. The win rate is path-dependent, not an edge (open — the measurement answer)
+- **Question asked:** is the win rate real edge or market regime?
+- **Answer:** neither, in the sense that matters. Outcomes track whether the move **continued after entry**, not the quality of the signal. The same detector, score, universe and payoff produced these per-session results:
+
+| session | spot path | win rate | BULLISH | BEARISH |
+|---|---|---|---|---|
+| 14 Oct | opened at the low, +2.21% by 11:00, then flat 4 h | 36.0% (n=75) | **6/35** | 21/40 |
+| 15 Oct | opened at the low, +2.21% by 14:00, kept going | 68.8% (n=80) | **53/60** | 2/20 |
+| 11 Nov | fell −1.12% all day | 54.5% (n=44) | 0/19 | 24/25 |
+| 12 Nov | flat (−0.03%), one morning dip to 07:10 | 32.8% (n=64) | 0/35 | 22/30 |
+
+- **Why "regime" alone does not explain it.** 14 Oct and 15 Oct had the *same shape* — both opened at the day's low and rallied 2.21% — yet BULLISH won 6/35 on one and 53/60 on the other. The difference is that 15 Oct kept rallying to 14:00 while 14 Oct stalled at 11:00 and spent four hours sideways, so calls bought into the stall were stopped out. That is path dependence, not drift.
+- **Pooled numbers are a coin flip.** 48.3% at trade level (n=263, CI 42–54) against a 39.9% break-even. Directional accuracy on the spot proxy is 53.2%, two-proportion p=0.31 against the censored 60.0% — indistinguishable.
+- **Trade-level n overstates the sample.** Trades fired in the same direction within 30 minutes are one decision, not many. Collapsing them gives **24 independent campaigns, 7 profitable = 29.2%** (exact binomial p=0.064 vs a coin flip). Not significant at 5%, but it leans negative, and it is the honest sample size.
+- **So where does +4.83%/trade come from?** The +30%/−20% barrier asymmetry, not directional skill. At 48.3% the payoff alone yields positive expectancy; the measurement does not show the barriers being hit more often than chance.
+- **What would change the verdict:** an up-trending day with clean BULLISH trades that keeps trending, and a down day with clean BEARISH trades that keeps falling — i.e. sessions where the *continuation* is not the only thing being measured. Until then, "53.3%" (or 48.3%) must not be quoted as accuracy or as evidence of edge.
+- **Reviewed with Gemini (Argon Medium) 2026-11-11:** it agreed the pooled rate is not distinguishable from a coin flip, and that the entry→exit alignment split (106/106 vs 0/93) is tautological because the exit is *caused* by the move. That split is deliberately not reported anywhere.
 
 ## Resolved
 
