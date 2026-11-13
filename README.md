@@ -102,7 +102,7 @@ options_chain       -- 60-day retention, primary data store
   spot_price        -- NIFTY spot in ₹
 
 signals             -- never deleted, anomaly detection output
-news_raw            -- 7-day retention
+news_raw            -- never deleted (~34 MB/year measured)
 news_summaries      -- 30-day retention
 ```
 
